@@ -28,6 +28,4 @@ node_modules/
 # tasks.json
 # tasks/ 
 
-# Mcp files
-.mcp*.json
-mcp.json
+index.gemini.js

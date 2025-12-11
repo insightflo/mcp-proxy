@@ -31,7 +31,11 @@ function loadKeyMapFromEnv() {
 }
 let KEY_MAP = loadKeyMapFromEnv();
 
-console.log('key loaded:', KEY_MAP);
+// [디버깅용 로그 추가]
+// 보안을 위해 값은 숨기고, 키(Key) 목록만 출력해서 USERKEY_... 가 있는지 확인
+console.log("[DEBUG] Loaded Env Keys:", Object.keys(process.env).filter(k => k.startsWith("USERKEY_")));
+
+console.log("[INIT] User keys loaded:", Object.keys(KEY_MAP));
 
 // ---------- Global State ----------
 
