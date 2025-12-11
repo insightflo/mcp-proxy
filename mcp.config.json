@@ -1,10 +1,7 @@
 {
   "servers": {
-    "example": {
-      "url": "https://your-mcp-server.example.com/jsonrpc",
-      "headers": {
-        "Authorization": "Bearer YOUR_API_KEY_IF_NEEDED"
-      }
+    "mcp-stock-analysis": {
+      "url": "https://n8n-auto.showk.ing/mcp/a37e9a48-8d70-4830-9dea-a244691fea27"
     }
-  }
+  }  
 }
