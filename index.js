@@ -333,6 +333,23 @@ app.get("/", (req, res) => {
   });
 });
 
+// OAuth 더미 엔드포인트 (Claude.ai 호환성)
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  res.status(404).json({ error: "OAuth not supported" });
+});
+
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  res.status(404).json({ error: "OAuth not supported" });
+});
+
+app.get("/.well-known/oauth-authorization-server/sse", (req, res) => {
+  res.status(404).json({ error: "OAuth not supported" });
+});
+
+app.get("/.well-known/oauth-protected-resource/sse", (req, res) => {
+  res.status(404).json({ error: "OAuth not supported" });
+});
+
 // SSE 초기 연결 (Claude가 여기로 연결) - 인증 필요
 app.get("/sse", async (req, res) => {
   // 1. 인증 확인 (Query parameter 또는 Authorization header)
@@ -372,8 +389,11 @@ app.get("/sse", async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no'); // Nginx buffering 방지
   
-  // Endpoint 이벤트 전송
-  sendSSE(res, 'endpoint', `/session/${sessionId}`);
+  // Endpoint 이벤트 전송 (전체 URL)
+  const protocol = req.headers['x-forwarded-proto'] || 'https';
+  const host = req.get('host');
+  const baseUrl = `${protocol}://${host}`;
+  sendSSE(res, 'endpoint', `${baseUrl}/session/${sessionId}`);
   
   // 세션 생성 (사용자 정보 포함)
   // tools는 빈 배열로 시작, tools/list 호출 시 n8n에서 받아옴
@@ -540,16 +560,6 @@ app.post("/session/:sessionId", async (req, res) => {
     
     res.status(200).end();
   }
-});
-
-
-// OAuth 더미 엔드포인트 (Claude.ai 호환성)
-app.get("/.well-known/oauth-authorization-server", (req, res) => {
-  res.status(404).json({ error: "OAuth not supported" });
-});
-
-app.get("/.well-known/oauth-protected-resource", (req, res) => {
-  res.status(404).json({ error: "OAuth not supported" });
 });
 
 // ========== Server Start ==========
