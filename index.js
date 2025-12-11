@@ -542,6 +542,16 @@ app.post("/session/:sessionId", async (req, res) => {
   }
 });
 
+
+// OAuth 더미 엔드포인트 (Claude.ai 호환성)
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  res.status(404).json({ error: "OAuth not supported" });
+});
+
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  res.status(404).json({ error: "OAuth not supported" });
+});
+
 // ========== Server Start ==========
 const port = process.env.PORT || 3000;
 app.listen(port, "0.0.0.0", () => {
