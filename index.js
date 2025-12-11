@@ -8,7 +8,16 @@ app.use(express.json({ limit: '1mb' }));
 app.use(cors());
 
 const config = JSON.parse(fs.readFileSync('./mcp.config.json', 'utf8'));
-const KEY_MAP = process.env.KEY_MAP ? JSON.parse(process.env.KEY_MAP) : {};
+
+const auth = req.headers["authorization"] || "";
+const userKey = auth.replace("Bearer ", "").trim();
+
+const KEY_MAP = JSON.parse(process.env.KEY_MAP);
+const REAL_KEY = KEY_MAP[userKey];
+
+if (!REAL_KEY) {
+  return res.status(403).json({ error: "Invalid user key" });
+}
 
 
 // 단순 헬스체크
