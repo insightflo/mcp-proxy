@@ -15,18 +15,22 @@ app.use(cors());
 // Load public config
 const config = JSON.parse(fs.readFileSync('./mcp.config.json', 'utf8'));
 
+
 // Load KEY_MAP from Railway env variable
-let KEY_MAP = {};
-try {
-  if (process.env.KEY_MAP) {
-    KEY_MAP = JSON.parse(process.env.KEY_MAP);
-    console.log("[INIT] Loaded KEY_MAP:", Object.keys(KEY_MAP));
-  } else {
-    console.warn("[WARN] KEY_MAP not set in environment variables!");
+function loadKeyMapFromEnv() {
+  const map = {};
+  for (const [envKey, value] of Object.entries(process.env)) {
+    if (envKey.startsWith("USERKEY_")) {
+      const user = envKey.replace("USERKEY_", "");
+      map[user] = value;
+    }
   }
-} catch (e) {
-  console.error("[ERROR] Failed parsing KEY_MAP:", e);
+  return map;
 }
+
+const KEY_MAP = loadKeyMapFromEnv();
+
+console.log("[INIT] User keys loaded:", Object.keys(KEY_MAP));
 
 // Health check
 app.get('/', (req, res) => {
