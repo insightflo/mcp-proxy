@@ -1,4 +1,4 @@
-// MCP Proxy: SSE Buffering Fix & Robust Logging
+// Remote MCP Server for Claude.ai Web/Mobile (With User Authentication)
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 if (!isRailway) {
   try {
@@ -8,24 +8,13 @@ if (!isRailway) {
 
 const express = require("express");
 const cors = require("cors");
-const fs = require("fs");
 const crypto = require("crypto");
 
 const app = express();
-// 대용량 응답 대비 제한 해제
 app.use(express.json({ limit: "50mb" }));
 app.use(cors());
 
-// ---------- Config & Keys ----------
-const config = JSON.parse(fs.readFileSync("./mcp.config.json", "utf8"));
-
-
-// [디버깅] 현재 환경변수 키 목록 전체 출력 (값은 보안상 출력 X)
-console.log("=== ENV DEBUG START ===");
-console.log("RAILWAY_ENVIRONMENT:", process.env.RAILWAY_ENVIRONMENT); 
-console.log("ALL KEYS:", Object.keys(process.env).sort());
-console.log("=== ENV DEBUG END ===");
-
+// ========== 사용자 인증 시스템 ==========
 function loadKeyMapFromEnv() {
   const map = {};
   for (const [envKey, value] of Object.entries(process.env)) {
@@ -36,294 +25,529 @@ function loadKeyMapFromEnv() {
   }
   return map;
 }
+
 let KEY_MAP = loadKeyMapFromEnv();
 
-// [디버깅용 로그 추가]
-// 보안을 위해 값은 숨기고, 키(Key) 목록만 출력해서 USERKEY_... 가 있는지 확인
-console.log("[DEBUG] Loaded Env Keys:", Object.keys(process.env).filter(k => k.startsWith("USERKEY_")));
+// 주기적으로 환경변수 다시 로드 (Railway에서 변경 시 반영)
+setInterval(() => {
+  const newKeyMap = loadKeyMapFromEnv();
+  if (Object.keys(newKeyMap).length > 0) {
+    KEY_MAP = newKeyMap;
+  }
+}, 60000); // 1분마다
 
-console.log("[INIT] User keys loaded:", Object.keys(KEY_MAP));
+console.log(`[Auth] Loaded ${Object.keys(KEY_MAP).length} user keys:`, Object.keys(KEY_MAP));
 
-// ---------- Global State ----------
+// 인증 검증 함수
+function authenticateUser(userKey) {
+  if (!KEY_MAP || Object.keys(KEY_MAP).length === 0) {
+    KEY_MAP = loadKeyMapFromEnv();
+  }
+  return KEY_MAP.hasOwnProperty(userKey);
+}
 
-// pendingRequests: ID -> { resolve, reject, timer }
+// 사용자 키로 실제 인증 값 가져오기
+function getRealKeyForUser(userKey) {
+  return KEY_MAP[userKey];
+}
+
+// ========== 세션 저장소 ==========
+// sessionId -> { userId, userRealKey, tools, lastActivity, res (SSE 응답 객체) }
+const sessions = new Map();
+
+// ========== n8n에서 도구 목록 가져오기 ==========
+async function getToolsFromN8n() {
+  try {
+    const session = await ensureN8nSession();
+    
+    const response = await fetch(session.sessionUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {})
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: crypto.randomUUID(),
+        method: "tools/list",
+        params: {}
+      })
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Failed to get tools: ${response.status}`);
+    }
+    
+    const result = await response.json();
+    console.log(`[n8n] Loaded ${result.result?.tools?.length || 0} tools`);
+    return result.result?.tools || [];
+    
+  } catch (error) {
+    console.error(`[n8n] Failed to load tools:`, error);
+    return [];
+  }
+}
+
+// ========== n8n MCP 서버 연결 설정 ==========
+const N8N_MCP_URL = process.env.N8N_MCP_URL || "https://n8n-auto.showk.ing/mcp/a37e9a48-8d70-4830-9dea-a244691fea27";
+const N8N_API_KEY = process.env.N8N_API_KEY || "";
+
+// n8n MCP 서버 세션 관리
+let n8nSession = null;
+let n8nSessionInitializing = false;
+
+// 대기중인 요청 매핑 (id -> sessionId)
 const pendingRequests = new Map();
 
-// serverSessions: serverName -> { initialized, sessionUrl, controller }
-const serverSessions = {};
-
-// ---------- Helpers ----------
-
-function buildMcpHeaders(target, realKey) {
-  return {
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/event-stream",
-    ...(target.headers || {}),
-    "Authorization": `Bearer ${realKey}`
-  };
-}
-
-// 수신된 JSON 메시지 처리
-function handleIncomingMessage(serverName, dataStr) {
-  let json;
-  try {
-    json = JSON.parse(dataStr);
-  } catch (e) {
-    // JSON 파싱 실패는 무시 (완전하지 않은 데이터일 수 있음)
-    return;
+async function ensureN8nSession() {
+  if (n8nSession && n8nSession.valid) {
+    return n8nSession;
   }
-
-  // [Debug] 들어온 메시지 ID 확인
-  // console.log(`[MCP][${serverName}] Received Msg ID: ${json.id || 'Notification'}`);
-
-  if (json.id && pendingRequests.has(json.id)) {
-    const { resolve, reject, timer } = pendingRequests.get(json.id);
-    clearTimeout(timer);
-    pendingRequests.delete(json.id);
-
-    if (json.error) {
-      reject(new Error(`MCP Error: ${JSON.stringify(json.error)}`));
-    } else {
-      resolve(json);
-    }
-  }
-}
-
-/**
- * SSE 연결 및 유지 (Buffering 로직 추가됨)
- */
-async function connectAndKeepAlive(serverName, targetUrl, headers) {
-  console.log(`[MCP][${serverName}] Connecting to SSE: ${targetUrl}`);
   
-  const controller = new AbortController();
-  const response = await fetch(targetUrl, {
-    method: "GET",
-    headers: { ...headers, "Accept": "text/event-stream", "Cache-Control": "no-cache" },
-    signal: controller.signal
-  });
-
-  if (!response.ok) {
-    throw new Error(`SSE connection failed: ${response.status}`);
+  if (n8nSessionInitializing) {
+    // 초기화 중이면 대기
+    await new Promise(resolve => setTimeout(resolve, 100));
+    return ensureN8nSession();
   }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-
-  let sessionUrl = null;
-  let buffer = ""; // [중요] 청크 조립용 버퍼
-
-  // 1단계: Endpoint 찾기 (초기 Handshake)
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) throw new Error("Stream ended before finding endpoint");
+  
+  n8nSessionInitializing = true;
+  
+  try {
+    console.log(`[n8n] Connecting to ${N8N_MCP_URL}...`);
     
-    // 버퍼에 쌓기
-    buffer += decoder.decode(value, { stream: true });
+    // SSE 연결
+    const controller = new AbortController();
+    const response = await fetch(N8N_MCP_URL, {
+      method: "GET",
+      headers: {
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-cache",
+        ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {})
+      },
+      signal: controller.signal
+    });
     
-    // 줄바꿈 기준으로 나누기
-    const lines = buffer.split("\n");
+    if (!response.ok) {
+      throw new Error(`n8n SSE connection failed: ${response.status}`);
+    }
     
-    // 마지막 조각은 아직 미완성일 수 있으므로 버퍼에 남겨둠
-    buffer = lines.pop(); 
-
-    for (const line of lines) {
-      if (line.trim().startsWith("event: endpoint")) {
-        // endpoint 이벤트 발견 시, 해당 라인 근처에서 data 찾기 로직이 필요하지만
-        // SSE는 순서대로 오므로 다음 줄이나 같은 배치에 data가 있음.
-        // 여기선 간단히 전체 lines 배열에서 검색
-        const dataLine = lines.find(l => l.trim().startsWith("data: "));
-        if (dataLine) {
-          const relativePath = dataLine.replace("data: ", "").trim();
-          sessionUrl = new URL(relativePath, targetUrl).toString();
-          break;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let sessionUrl = null;
+    
+    // Endpoint 찾기
+    while (!sessionUrl) {
+      const { done, value } = await reader.read();
+      if (done) throw new Error("Stream ended before finding endpoint");
+      
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      
+      for (const line of lines) {
+        if (line.trim().startsWith("event: endpoint")) {
+          const dataLine = lines.find(l => l.trim().startsWith("data: "));
+          if (dataLine) {
+            const relativePath = dataLine.replace("data: ", "").trim();
+            sessionUrl = new URL(relativePath, N8N_MCP_URL).toString();
+            break;
+          }
         }
       }
     }
-    if (sessionUrl) break;
-  }
-
-  console.log(`[MCP][${serverName}] Session URL acquired: ${sessionUrl}`);
-
-  // 2단계: 백그라운드 리스닝 (완벽한 Buffering 지원)
-  (async () => {
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          console.log(`[MCP][${serverName}] SSE connection closed by server.`);
-          if (serverSessions[serverName]) {
-             serverSessions[serverName].initialized = false;
-             serverSessions[serverName].sessionUrl = null;
-          }
-          break;
+    
+    console.log(`[n8n] Session URL: ${sessionUrl}`);
+    
+    // Initialize
+    const initResponse = await fetch(sessionUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {})
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: crypto.randomUUID(),
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          clientInfo: { name: "Remote-MCP-Proxy", version: "1.0.0" },
+          capabilities: {}
         }
-        
-        // [핵심] 버퍼링: 이전 조각 + 새 조각
-        buffer += decoder.decode(value, { stream: true });
-        
-        // 줄 단위 분리
-        const lines = buffer.split("\n");
-        
-        // 마지막 요소는 "아직 끝나지 않은 줄"일 수 있으므로 다시 버퍼에 저장하고 처리에서 제외
-        buffer = lines.pop(); 
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("data: ")) {
-            const jsonStr = trimmed.replace("data: ", "").trim();
-            if (jsonStr && jsonStr !== "[DONE]") {
-               handleIncomingMessage(serverName, jsonStr);
+      })
+    });
+    
+    if (!initResponse.ok) {
+      throw new Error(`n8n initialize failed: ${initResponse.status}`);
+    }
+    
+    console.log(`[n8n] Initialized successfully`);
+    
+    // 백그라운드 SSE 리스너
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            console.log(`[n8n] SSE closed`);
+            if (n8nSession) n8nSession.valid = false;
+            break;
+          }
+          
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
+          
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith("data: ")) {
+              const jsonStr = trimmed.replace("data: ", "").trim();
+              if (jsonStr && jsonStr !== "[DONE]") {
+                try {
+                  const msg = JSON.parse(jsonStr);
+                  console.log(`[n8n] Received message with ID: ${msg.id}`);
+                  
+                  // ID로 세션 찾기
+                  const sessionId = pendingRequests.get(msg.id);
+                  if (sessionId) {
+                    const session = sessions.get(sessionId);
+                    if (session && session.res && !session.res.writableEnded) {
+                      // 클라이언트 SSE로 전달
+                      sendSSE(session.res, 'message', msg);
+                      console.log(`[Relay] Forwarded to session ${sessionId}`);
+                    }
+                    pendingRequests.delete(msg.id);
+                  }
+                } catch (e) {
+                  console.error(`[n8n] JSON parse error:`, e.message);
+                }
+              }
             }
           }
         }
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          console.warn(`[n8n] SSE Error:`, err.message);
+        }
       }
-    } catch (err) {
-      if (err.name !== 'AbortError') {
-        console.warn(`[MCP][${serverName}] Background SSE Error:`, err.message);
-      }
-    }
-  })();
-
-  return { sessionUrl, controller };
-}
-
-/**
- * MCP 요청 전송 및 응답 대기
- */
-async function sendMcpRequestAndWait(sessionUrl, headers, method, params, explicitId = null) {
-  const id = explicitId || crypto.randomUUID();
-  
-  // 1. 응답 대기 설정
-  const responsePromise = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (pendingRequests.has(id)) {
-        pendingRequests.delete(id);
-        reject(new Error(`MCP Request Timeout (${method}, ID: ${id})`));
-      }
-    }, 30000); // 30초 타임아웃
+    })();
     
-    pendingRequests.set(id, { resolve, reject, timer });
-  });
-
-  // 2. 요청 전송
-  const jsonRpcRequest = {
-    jsonrpc: "2.0",
-    id,
-    method,
-    params: params || {}
-  };
-
-  // console.log(`[Debug] Sending ID: ${id}`); // 디버깅용
-
-  const res = await fetch(sessionUrl, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(jsonRpcRequest)
-  });
-
-  if (!res.ok) {
-    pendingRequests.delete(id);
-    throw new Error(`MCP POST failed: ${res.status}`);
-  }
-
-  // 3. Notification은 대기하지 않음
-  if (method === 'initialized' || method.startsWith('notifications/')) {
-    pendingRequests.delete(id);
-    return null;
-  }
-
-  // 4. SSE로 응답이 올 때까지 대기
-  return await responsePromise;
-}
-
-// ---------- API Routes ----------
-
-async function ensureInitialized(serverName, target, realKey) {
-  if (!serverSessions[serverName]) {
-    serverSessions[serverName] = { initialized: false, initializingPromise: null, sessionUrl: null, controller: null };
-  }
-  const session = serverSessions[serverName];
-
-  if (session.initialized && session.sessionUrl) return session.sessionUrl;
-  if (session.initializingPromise) return await session.initializingPromise;
-
-  session.initializingPromise = (async () => {
-    try {
-      const headers = buildMcpHeaders(target, realKey);
-      if (session.controller) session.controller.abort();
-
-      const { sessionUrl, controller } = await connectAndKeepAlive(serverName, target.url, headers);
-      session.sessionUrl = sessionUrl;
-      session.controller = controller;
-
-      console.log(`[MCP][${serverName}] Sending initialize...`);
-      await sendMcpRequestAndWait(sessionUrl, headers, "initialize", {
-          protocolVersion: "2024-11-05",
-          clientInfo: { name: "MCP-Proxy", version: "1.0.0" },
-          capabilities: {}
-      });
-      console.log(`[MCP][${serverName}] initialize OK`);
-
-      await sendMcpRequestAndWait(sessionUrl, headers, "initialized", {});
-      console.log(`[MCP][${serverName}] initialized OK`);
-      
-      session.initialized = true;
-      return sessionUrl;
-
-    } catch (err) {
-      console.error(`[MCP][${serverName}] Handshake Failed:`, err);
-      session.initialized = false;
-      session.sessionUrl = null;
-      if (session.controller) session.controller.abort();
-      throw err;
-    } finally {
-      session.initializingPromise = null;
-    }
-  })();
-
-  return session.initializingPromise;
-}
-
-app.get("/", (req, res) => res.json({ status: "ok" }));
-
-app.post("/mcp/call", async (req, res) => {
-  try {
-    const authHeader = req.headers["authorization"] || "";
-    const userKey = authHeader.replace("Bearer", "").trim();
-
-    if (!KEY_MAP || Object.keys(KEY_MAP).length === 0) KEY_MAP = loadKeyMapFromEnv();
-    const REAL_KEY = KEY_MAP[userKey];
-    if (!REAL_KEY) return res.status(403).json({ error: "Invalid user key" });
-
-    const { server, method, params, id } = req.body || {};
-    if (!server || !method) return res.status(400).json({ error: "Missing server/method" });
-
-    const target = config.servers[server];
-    if (!target) return res.status(400).json({ error: "Unknown server" });
-
-    const sessionUrl = await ensureInitialized(server, target, REAL_KEY);
-
-    // 로그에 ID를 명시하여 추적
-    const requestId = id || crypto.randomUUID();
-    console.log(`[MCP Proxy] Forwarding ${method} (ID: ${requestId})`);
-
-    const result = await sendMcpRequestAndWait(
+    n8nSession = {
       sessionUrl,
-      buildMcpHeaders(target, REAL_KEY),
-      method,
-      params,
-      requestId // 여기서 ID를 고정하여 넘김
-    );
+      controller,
+      valid: true,
+      lastActivity: Date.now()
+    };
+    
+    return n8nSession;
+    
+  } catch (error) {
+    console.error(`[n8n] Connection failed:`, error);
+    n8nSession = null;
+    throw error;
+  } finally {
+    n8nSessionInitializing = false;
+  }
+}
 
-    return res.status(200).json(result);
+// ========== 실제 도구 실행 함수 (n8n 호출) ==========
+async function executeTool(toolName, args) {
+  console.log(`[Tool] ${toolName}`, args);
+  
+  try {
+    const session = await ensureN8nSession();
+    
+    const response = await fetch(session.sessionUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {})
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: crypto.randomUUID(),
+        method: "tools/call",
+        params: {
+          name: toolName,
+          arguments: args
+        }
+      })
+    });
+    
+    if (!response.ok) {
+      throw new Error(`n8n tool call failed: ${response.status}`);
+    }
+    
+    const result = await response.json();
+    
+    // n8n에서 받은 응답 처리
+    if (result.result && result.result.content) {
+      return result.result.content;
+    } else if (result.result) {
+      return [{ type: "text", text: JSON.stringify(result.result) }];
+    } else {
+      throw new Error("Invalid response from n8n");
+    }
+    
+  } catch (error) {
+    console.error(`[Tool Error] ${toolName}:`, error);
+    return [{
+      type: "text",
+      text: `도구 실행 중 오류 발생: ${error.message}`
+    }];
+  }
+}
 
-  } catch (err) {
-    console.error("[MCP Proxy Error]", err);
-    return res.status(500).json({ error: err.message });
+// ========== SSE Helper ==========
+function sendSSE(res, event, data) {
+  if (res.writableEnded) return;
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+// ========== 세션 정리 (10분 비활성) ==========
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, session] of sessions.entries()) {
+    if (now - session.lastActivity > 10 * 60 * 1000) {
+      console.log(`[Session] Cleanup: ${sessionId} (user: ${session.userId})`);
+      if (session.res && !session.res.writableEnded) {
+        session.res.end();
+      }
+      sessions.delete(sessionId);
+    }
+  }
+}, 60 * 1000); // 1분마다 체크
+
+// ========== Routes ==========
+
+// Health check
+app.get("/", (req, res) => {
+  res.json({ 
+    status: "ok",
+    service: "Remote MCP Server (Authenticated)",
+    version: "1.0.0",
+    activeSessions: sessions.size,
+    registeredUsers: Object.keys(KEY_MAP).length
+  });
+});
+
+// SSE 초기 연결 (Claude가 여기로 연결) - 인증 필요
+app.get("/sse", async (req, res) => {
+  // 1. 인증 확인 (Query parameter 또는 Authorization header)
+  const authHeader = req.headers["authorization"] || "";
+  const queryKey = req.query.key || "";
+  
+  // Bearer 토큰에서 키 추출
+  const headerKey = authHeader.replace("Bearer", "").trim();
+  const userKey = headerKey || queryKey;
+  
+  if (!userKey) {
+    res.status(401).json({ 
+      error: "Authentication required",
+      message: "Provide key via ?key=YOUR_KEY or Authorization: Bearer YOUR_KEY"
+    });
+    return;
+  }
+  
+  if (!authenticateUser(userKey)) {
+    console.log(`[Auth] Failed authentication attempt: ${userKey}`);
+    res.status(403).json({ 
+      error: "Invalid authentication key",
+      message: "The provided key is not authorized"
+    });
+    return;
+  }
+  
+  console.log(`[Auth] User authenticated: ${userKey}`);
+  
+  // 2. 세션 생성
+  const sessionId = crypto.randomUUID();
+  
+  console.log(`[SSE] New connection: ${sessionId} (user: ${userKey})`);
+  
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Nginx buffering 방지
+  
+  // Endpoint 이벤트 전송
+  sendSSE(res, 'endpoint', `/session/${sessionId}`);
+  
+  // 세션 생성 (사용자 정보 포함)
+  // tools는 빈 배열로 시작, tools/list 호출 시 n8n에서 받아옴
+  sessions.set(sessionId, {
+    userId: userKey,
+    tools: [],
+    lastActivity: Date.now(),
+    res: res
+  });
+  
+  console.log(`[SSE] Session ${sessionId} created for user ${userKey}`);
+  
+  // 연결 종료 처리
+  req.on('close', () => {
+    console.log(`[SSE] Connection closed: ${sessionId} (user: ${userKey})`);
+    sessions.delete(sessionId);
+  });
+  
+  // Keep-alive (30초마다 핑)
+  const keepAlive = setInterval(() => {
+    if (res.writableEnded) {
+      clearInterval(keepAlive);
+      return;
+    }
+    res.write(': ping\n\n');
+  }, 30000);
+  
+  req.on('close', () => clearInterval(keepAlive));
+});
+
+// 세션별 JSON-RPC 처리
+app.post("/session/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+  
+  if (!session) {
+    return res.status(404).json({
+      jsonrpc: "2.0",
+      id: req.body.id,
+      error: { code: -32001, message: "Session not found or expired" }
+    });
+  }
+  
+  session.lastActivity = Date.now();
+  
+  const { jsonrpc, id, method, params } = req.body;
+  
+  console.log(`[RPC][${sessionId}][${session.userId}] ${method}`);
+  
+  try {
+    let result;
+    
+    switch (method) {
+      case "initialize":
+        result = {
+          protocolVersion: "2024-11-05",
+          serverInfo: {
+            name: "Stock Analysis MCP",
+            version: "1.0.0"
+          },
+          capabilities: {
+            tools: {}
+          }
+        };
+        break;
+        
+      case "initialized":
+        // notification이므로 응답 불필요
+        return res.status(200).end();
+        
+      case "tools/list":
+        // n8n에 tools/list 요청 전달
+        const n8nSession_list = await ensureN8nSession();
+        
+        // 대기 목록에 등록
+        pendingRequests.set(id, sessionId);
+        
+        const listResponse = await fetch(n8nSession_list.sessionUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {})
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: id,
+            method: "tools/list",
+            params: params || {}
+          })
+        });
+        
+        if (!listResponse.ok) {
+          pendingRequests.delete(id);
+          throw new Error(`tools/list failed: ${listResponse.status}`);
+        }
+        
+        // POST 응답은 무시하고 SSE로 받을 때까지 대기
+        // n8n이 SSE로 보낸 응답은 자동으로 클라이언트에게 전달됨
+        return res.status(200).end();
+        
+      case "tools/call":
+        const { name, arguments: args } = params;
+        const n8nSession_call = await ensureN8nSession();
+        
+        // 대기 목록에 등록
+        pendingRequests.set(id, sessionId);
+        
+        const callResponse = await fetch(n8nSession_call.sessionUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {})
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: id,
+            method: "tools/call",
+            params: {
+              name: name,
+              arguments: args
+            }
+          })
+        });
+        
+        if (!callResponse.ok) {
+          pendingRequests.delete(id);
+          throw new Error(`tools/call failed: ${callResponse.status}`);
+        }
+        
+        // POST 응답은 무시하고 SSE로 받을 때까지 대기
+        return res.status(200).end();
+        
+      default:
+        throw { code: -32601, message: "Method not found" };
+    }
+    
+    // SSE로 응답 전송 (비동기)
+    if (session.res && !session.res.writableEnded) {
+      sendSSE(session.res, 'message', {
+        jsonrpc: "2.0",
+        id: id,
+        result: result
+      });
+    }
+    
+    // HTTP 응답은 즉시 200 OK (SSE가 실제 데이터 전송)
+    res.status(200).end();
+    
+  } catch (error) {
+    console.error(`[RPC Error][${sessionId}]`, error);
+    
+    const errorResponse = {
+      jsonrpc: "2.0",
+      id: id,
+      error: {
+        code: error.code || -32603,
+        message: error.message || "Internal error"
+      }
+    };
+    
+    if (session.res && !session.res.writableEnded) {
+      sendSSE(session.res, 'message', errorResponse);
+    }
+    
+    res.status(200).end();
   }
 });
 
+// ========== Server Start ==========
 const port = process.env.PORT || 3000;
 app.listen(port, "0.0.0.0", () => {
-  console.log(`MCP Proxy running on port ${port}`);
+  console.log(`✅ Remote MCP Server (Authenticated) running on port ${port}`);
+  console.log(`📡 SSE Endpoint: http://localhost:${port}/sse`);
+  console.log(`🔗 n8n Backend: ${N8N_MCP_URL}`);
+  console.log(`🔐 Registered users: ${Object.keys(KEY_MAP).length}`);
+  console.log(`📦 Tools will be loaded from n8n on first connection`);
 });

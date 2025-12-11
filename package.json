@@ -1,21 +1,21 @@
 {
-  "name": "mcp-proxy",
+  "name": "remote-mcp-server",
   "version": "1.0.0",
-  "description": "HTTP → MCP(JSON-RPC) proxy for GPT Apps",
+  "description": "Remote MCP Server for Claude.ai (n8n backend)",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
-  "keywords": [
-    "mcp",
-    "proxy",
-    "json-rpc"
-  ],
-  "author": "",
+  "keywords": ["mcp", "claude", "ai", "n8n"],
+  "author": "dk",
   "license": "MIT",
   "dependencies": {
-    "cors": "^2.8.5",
+    "express": "^4.19.2",
     "dotenv": "^17.2.3",
-    "express": "^4.19.2"
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
