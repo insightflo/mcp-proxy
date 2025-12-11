@@ -19,6 +19,13 @@ app.use(cors());
 // ---------- Config & Keys ----------
 const config = JSON.parse(fs.readFileSync("./mcp.config.json", "utf8"));
 
+
+// [디버깅] 현재 환경변수 키 목록 전체 출력 (값은 보안상 출력 X)
+console.log("=== ENV DEBUG START ===");
+console.log("RAILWAY_ENVIRONMENT:", process.env.RAILWAY_ENVIRONMENT); 
+console.log("ALL KEYS:", Object.keys(process.env).sort());
+console.log("=== ENV DEBUG END ===");
+
 function loadKeyMapFromEnv() {
   const map = {};
   for (const [envKey, value] of Object.entries(process.env)) {
