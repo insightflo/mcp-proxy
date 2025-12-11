@@ -31,6 +31,8 @@ function loadKeyMapFromEnv() {
 }
 let KEY_MAP = loadKeyMapFromEnv();
 
+console.log('key loaded:', KEY_MAP);
+
 // ---------- Global State ----------
 
 // pendingRequests: ID -> { resolve, reject, timer }
