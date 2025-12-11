@@ -1,3 +1,8 @@
+// MCP Proxy - Multi User Version (Final)
+// - Authorization: Bearer userKey  → KEY_MAP[userKey] → REAL MCP KEY
+// - JSON-RPC proxy forwarding
+// - Fully compatible with GPT Actions + Railway
+
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -7,118 +12,132 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(cors());
 
+// Load public config
 const config = JSON.parse(fs.readFileSync('./mcp.config.json', 'utf8'));
 
-const auth = req.headers["authorization"] || "";
-const userKey = auth.replace("Bearer ", "").trim();
-
-const KEY_MAP = JSON.parse(process.env.KEY_MAP);
-const REAL_KEY = KEY_MAP[userKey];
-
-if (!REAL_KEY) {
-  return res.status(403).json({ error: "Invalid user key" });
+// Load KEY_MAP from Railway env variable
+let KEY_MAP = {};
+try {
+  if (process.env.KEY_MAP) {
+    KEY_MAP = JSON.parse(process.env.KEY_MAP);
+    console.log("[INIT] Loaded KEY_MAP:", Object.keys(KEY_MAP));
+  } else {
+    console.warn("[WARN] KEY_MAP not set in environment variables!");
+  }
+} catch (e) {
+  console.error("[ERROR] Failed parsing KEY_MAP:", e);
 }
 
-
-// 단순 헬스체크
+// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'MCP Proxy running' });
+  res.json({ status: "ok", message: "MCP Proxy running" });
 });
 
-/**
- * POST /mcp/call
- *
- * body 예시:
- * {
- *   "server": "example",
- *   "method": "tools/call",
- *   "params": {
- *     "name": "search",
- *     "arguments": { "query": "삼성전자 실적" }
- *   }
- * }
- */
 app.post('/mcp/call', async (req, res) => {
   try {
-    const { server, method, params } = req.body || {};
+    //
+    // 1) Read userKey from Authorization header
+    //
+    const auth = req.headers["authorization"] || "";
+    const userKey = auth.replace("Bearer", "").trim();
 
-    if (!server || !method) {
-      return res.status(400).json({
-        error: 'server, method 는 필수입니다.'
+    if (!userKey) {
+      return res.status(401).json({
+        error: "Missing Authorization header. Expected 'Authorization: Bearer <userKey>'"
       });
     }
 
+    //
+    // 2) UserKey → REAL MCP KEY
+    //
+    const REAL_KEY = KEY_MAP[userKey];
+
+    if (!REAL_KEY) {
+      return res.status(403).json({
+        error: "Invalid user key",
+        userKey
+      });
+    }
+
+    //
+    // 3) Parse body
+    //
+    const { server, method, params } = req.body || {};
+    if (!server || !method) {
+      return res.status(400).json({
+        error: "Missing required fields: server, method"
+      });
+    }
+
+    //
+    // 4) Load target server config
+    //
     const target = config.servers[server];
     if (!target) {
       return res.status(400).json({
-        error: `알 수 없는 server: ${server}`
+        error: `Unknown server: ${server}`,
+        availableServers: Object.keys(config.servers)
       });
     }
 
-    // 1) 유저 키 읽기 (헤더에서)
-    const userKey = req.headers['x-user-key'];
-    if (!userKey) {
-      return res.status(401).json({
-        error: 'X-User-Key 헤더가 필요합니다.'
-      });
-    }
-
-    // 2) 유저 키 → 실제 백엔드 키 매핑
-    const realKey = KEY_MAP[userKey];
-    if (!realKey) {
-      return res.status(403).json({
-        error: '유효하지 않은 X-User-Key 입니다.'
-      });
-    }
-
-    const url = target.url;
-
-    // 3) MCP 서버로 보낼 헤더 구성
-    const headers = {
-      'Content-Type': 'application/json',
-      ...(target.headers || {}),        // 필요하면 추가 header
-      'Authorization': `Bearer ${realKey}`  // 여기서 실제 키 주입
-    };
-
-    const id = crypto.randomUUID();
-
+    //
+    // 5) Build JSON-RPC call
+    //
     const jsonRpcRequest = {
-      jsonrpc: '2.0',
-      id,
+      jsonrpc: "2.0",
+      id: crypto.randomUUID(),
       method,
       params: params || {}
     };
 
+    //
+    // 6) Forward request to actual MCP server
+    //
+    const url = target.url;
+
+    const headers = {
+      "Content-Type": "application/json",
+      ...(target.headers || {}),
+      "Authorization": `Bearer ${REAL_KEY}`     // ★ 핵심: 실제 MCP Key 삽입
+    };
+
     const response = await fetch(url, {
-      method: 'POST',
+      method: "POST",
       headers,
       body: JSON.stringify(jsonRpcRequest)
     });
 
     const text = await response.text();
-    let json;
+
+    //
+    // 7) Parse response JSON
+    //
+    let data;
     try {
-      json = JSON.parse(text);
-    } catch (e) {
+      data = JSON.parse(text);
+    } catch {
       return res.status(502).json({
-        error: 'MCP 서버 응답이 JSON 이 아닙니다.',
+        error: "Invalid JSON returned by MCP server",
         raw: text
       });
     }
 
-    return res.status(200).json(json);
+    //
+    // 8) Return JSON-RPC response
+    //
+    return res.status(200).json(data);
+
   } catch (err) {
-    console.error('MCP Proxy error:', err);
+    console.error("[Proxy Error]", err);
     return res.status(500).json({
-      error: 'Internal MCP Proxy error',
+      error: "Internal MCP Proxy error",
       detail: err.message
     });
   }
 });
 
-
+// Run server
 const port = process.env.PORT || 3000;
 app.listen(port, "0.0.0.0", () => {
-  console.log(`MCP Proxy listening on port ${port}`);
+  console.log(`MCP Proxy running on port ${port}`);
 });
-
