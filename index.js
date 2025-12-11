@@ -351,7 +351,8 @@ app.get("/.well-known/oauth-protected-resource/sse", (req, res) => {
 });
 
 // SSE 초기 연결 (Claude가 여기로 연결) - 인증 필요
-app.get("/sse", async (req, res) => {
+// GET과 POST 모두 처리
+app.all("/sse", async (req, res) => {
   // 1. 인증 확인 (Query parameter 또는 Authorization header)
   const authHeader = req.headers["authorization"] || "";
   const queryKey = req.query.key || "";
@@ -389,11 +390,8 @@ app.get("/sse", async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no'); // Nginx buffering 방지
   
-  // Endpoint 이벤트 전송 (전체 URL)
-  const protocol = req.headers['x-forwarded-proto'] || 'https';
-  const host = req.get('host');
-  const baseUrl = `${protocol}://${host}`;
-  sendSSE(res, 'endpoint', `${baseUrl}/session/${sessionId}`);
+  // Endpoint 이벤트 전송 (상대 경로)
+  sendSSE(res, 'endpoint', `/session/${sessionId}`);
   
   // 세션 생성 (사용자 정보 포함)
   // tools는 빈 배열로 시작, tools/list 호출 시 n8n에서 받아옴
