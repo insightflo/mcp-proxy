@@ -1,4 +1,4 @@
-// Remote MCP Server for Claude.ai (Tools Fix)
+// Remote MCP Server for Claude.ai (Sync Bridge Mode)
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 if (!isRailway) {
   try {
@@ -14,11 +14,12 @@ const app = express();
 app.use(express.json({ limit: "50mb" }));
 app.use(cors());
 
-// 디버깅: 요청 내용 자세히 보기
+// 디버깅: 요청 내용 로깅
 app.use((req, res, next) => {
   if (req.path === "/" || req.path === "/favicon.ico") return next();
   if (req.path === "/sse" && req.method === "POST") {
-    const bodySnippet = JSON.stringify(req.body).substring(0, 150);
+    // 본문 내용은 너무 길면 자름
+    const bodySnippet = JSON.stringify(req.body).substring(0, 100);
     console.log(`[HTTP] POST /sse Payload: ${bodySnippet}...`);
   } else {
     console.log(`[HTTP] ${req.method} ${req.path}`);
@@ -26,16 +27,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// ========== 세션 및 설정 ==========
-// sessions: Map<sessionId, { res, connectedAt }>
-const sessions = new Map();
-// pendingRequests: Map<requestId, sessionId>
-const pendingRequests = new Map();
-
+// ========== 설정 ==========
 const N8N_MCP_URL = process.env.N8N_MCP_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 
-// ========== n8n 연결 관리 (Promise Singleton Pattern) ==========
+// ========== 동기화 브릿지 (Sync Bridge) ==========
+// 요청 ID -> Promise Resolver 맵핑
+// n8n에서 응답이 오면 이 맵에서 찾아서 HTTP 응답을 즉시 보냄
+const responseWaiters = new Map();
+
+// ========== n8n 연결 관리 (Promise Singleton) ==========
 let n8nGlobalSession = null;
 let n8nConnectionPromise = null;
 
@@ -96,7 +97,7 @@ async function ensureN8nGlobalConnection() {
         })
       });
 
-      // Background Listener
+      // Background Listener (브릿지 핵심)
       (async () => {
         try {
           while (true) {
@@ -112,19 +113,13 @@ async function ensureN8nGlobalConnection() {
                 if (jsonStr && jsonStr !== "[DONE]") {
                   try {
                     const msg = JSON.parse(jsonStr);
-                    // 결과가 오면 누가 요청했는지 찾아서 SSE로 전송
-                    const sessionId = pendingRequests.get(msg.id);
-                    if (sessionId) {
-                      const session = sessions.get(sessionId);
-                      if (session && session.res) {
-                        sendSSE(session.res, 'message', JSON.stringify(msg));
-                        console.log(`[Relay] Response for ID ${msg.id} sent to session ${sessionId}`);
-                      }
-                      pendingRequests.delete(msg.id);
-                    } else {
-                      // ID를 못 찾으면 브로드캐스트 (fallback)
-                      // console.log(`[Relay] No session for ID ${msg.id}, broadcasting...`);
-                      // broadcastToAll(msg);
+                    
+                    // [핵심] 기다리고 있는 HTTP 요청이 있는지 확인
+                    if (msg.id && responseWaiters.has(msg.id)) {
+                      const resolve = responseWaiters.get(msg.id);
+                      resolve(msg); // 약속 이행! (HTTP 응답 발송)
+                      responseWaiters.delete(msg.id);
+                      console.log(`[Bridge] Matched response for ID ${msg.id}`);
                     }
                   } catch (e) {}
                 }
@@ -154,13 +149,6 @@ async function ensureN8nGlobalConnection() {
   return n8nConnectionPromise;
 }
 
-function sendSSE(res, event, data) {
-  if (res.writableEnded) return;
-  res.write(`event: ${event}\n`);
-  const payload = typeof data === 'string' ? data : JSON.stringify(data);
-  res.write(`data: ${payload}\n\n`);
-}
-
 // ========== Auth0 Metadata ==========
 const AUTH0_METADATA = {
   issuer: `https://${process.env.AUTH0_DOMAIN}/`,
@@ -179,14 +167,18 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => res.json(RESOURCE
 app.get("/.well-known/oauth-authorization-server/sse", (req, res) => res.json(AUTH0_METADATA));
 app.get("/.well-known/oauth-protected-resource/sse", (req, res) => res.json(RESOURCE_METADATA));
 
+
 // ========== Routes ==========
 
-// [핵심 수정] POST /sse 핸들러
+// [최종 수정] HTTP POST 핸들러 (동기식 대기 모드)
 app.post("/sse", async (req, res) => {
+  // 토큰 로그만 찍고 넘어감 (Claude가 안 보내는 경우가 많아서 강제하면 안됨)
   const authHeader = req.headers["authorization"] || "";
-  if (!authHeader.startsWith("Bearer ")) console.log("[POST/sse] No Token provided (Ignoring)");
+  if (!authHeader.startsWith("Bearer ")) {
+    // console.log("[POST/sse] No Token provided (Proceeding anyway)");
+  }
 
-  // 1. Initialize 요청: 즉시 응답 (Handshake)
+  // 1. Initialize 요청: 즉시 응답
   if (req.body && req.body.method === "initialize") {
     console.log("[POST/sse] Handling Initialization");
     return res.json({
@@ -200,96 +192,77 @@ app.post("/sse", async (req, res) => {
     });
   }
 
-  // 2. 그 외 요청 (tools/list 등): n8n으로 전달하고 "기다려(202)" 응답
-  if (req.body && req.body.method) {
+  // 2. 알림(Notifications): 응답 기다릴 필요 없음
+  if (req.body && req.body.method && req.body.method.startsWith("notifications/")) {
+     // n8n으로 쏘고 잊어버림
+     ensureN8nGlobalConnection().then(n8n => {
+        if(n8n && n8n.sessionUrl) {
+            fetch(n8n.sessionUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
+                body: JSON.stringify(req.body)
+            }).catch(e => console.error(e));
+        }
+     });
+     return res.status(200).send("OK");
+  }
+
+  // 3. 도구 실행/목록 (tools/list, tools/call) -> 응답을 기다려야 함!
+  if (req.body && req.body.id) {
     try {
       const n8n = await ensureN8nGlobalConnection();
       if (!n8n || !n8n.sessionUrl) throw new Error("n8n connection unavailable");
 
-      // [중요] 이 요청의 응답을 받을 SSE 세션을 찾아야 함
-      // POST /sse는 Stateless라서 세션 ID가 없음. 
-      // 해결책: 가장 최근에 생성된(가장 마지막) SSE 세션을 주인으로 가정 (단일 사용자 환경에서 유효)
-      const lastSessionId = Array.from(sessions.keys()).pop();
-      
-      if (lastSessionId) {
-        pendingRequests.set(req.body.id, lastSessionId);
-        console.log(`[POST/sse] Relaying ${req.body.method} (linked to session ${lastSessionId})`);
-      } else {
-        console.warn(`[POST/sse] Warning: No active SSE session found to return result`);
-      }
-      
+      console.log(`[Bridge] Relaying ${req.body.method} (ID: ${req.body.id}) - Waiting for response...`);
+
+      // n8n에 요청 전송
       await fetch(n8n.sessionUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
         body: JSON.stringify(req.body)
       });
-      
-      // [수정] 빈 JSON 객체를 주는 대신 202 Accepted를 주어 SSE로 답이 올 때까지 기다리게 함
-      return res.status(202).end();
+
+      // [핵심] n8n이 답을 줄 때까지 Promise로 기다림 (최대 25초 타임아웃)
+      const n8nResponse = await new Promise((resolve, reject) => {
+        // 대기열에 등록
+        responseWaiters.set(req.body.id, resolve);
+        
+        // 타임아웃 설정 (Railway/Claude 타임아웃 방지)
+        setTimeout(() => {
+          if (responseWaiters.has(req.body.id)) {
+            responseWaiters.delete(req.body.id);
+            reject(new Error("Timeout waiting for n8n response"));
+          }
+        }, 25000); // 25초
+      });
+
+      // 답이 오면 바로 JSON으로 반환! (이게 Claude가 원하는 것)
+      return res.json(n8nResponse);
 
     } catch(e) {
-      console.error(`[POST/sse Error] ${e.message}`);
-      return res.status(500).json({ error: { code: -32603, message: "Internal Proxy Error" } });
+      console.error(`[Bridge Error] ${e.message}`);
+      return res.status(500).json({ 
+        jsonrpc: "2.0", 
+        id: req.body.id, 
+        error: { code: -32603, message: e.message || "Internal Proxy Error" } 
+      });
     }
   }
 
   return res.status(200).send("OK");
 });
 
-// SSE Connection (GET)
+// SSE Connection (GET) - 혹시 모르니 살려두지만, 필수는 아님
 app.get("/sse", (req, res) => {
-  const authHeader = req.headers["authorization"] || "";
-  if (!authHeader.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
-
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no'
   });
-
   res.write(": welcome\n\n");
-
-  const sessionId = crypto.randomUUID();
-  sessions.set(sessionId, { connectedAt: Date.now(), res: res });
-  console.log(`[SSE] Session Created: ${sessionId}`);
-
-  sendSSE(res, 'endpoint', `/session/${sessionId}`);
-
-  const pinger = setInterval(() => res.write(": ping\n\n"), 15000);
-
-  req.on('close', () => {
-    console.log(`[SSE] Closed: ${sessionId}`);
-    clearInterval(pinger);
-    sessions.delete(sessionId);
-  });
-});
-
-// JSON-RPC via Session URL
-app.post("/session/:sessionId", async (req, res) => {
-  const { sessionId } = req.params;
-  const session = sessions.get(sessionId);
-  if (!session) return res.status(404).json({ error: "Session not found" });
-
-  try {
-    const n8n = await ensureN8nGlobalConnection();
-    pendingRequests.set(req.body.id, sessionId);
-
-    if (!n8n || !n8n.sessionUrl) throw new Error("Backend unavailable");
-
-    const response = await fetch(n8n.sessionUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
-      body: JSON.stringify(req.body)
-    });
-
-    if (!response.ok) throw new Error("Backend error");
-    res.status(202).end();
-
-  } catch (error) {
-    console.error(`[RPC Error]`, error);
-    res.status(500).json({ error: error.message });
-  }
+  const keepAlive = setInterval(() => res.write(": ping\n\n"), 15000);
+  req.on('close', () => clearInterval(keepAlive));
 });
 
 const port = process.env.PORT || 3000;
