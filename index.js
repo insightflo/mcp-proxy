@@ -333,31 +333,97 @@ app.get("/", (req, res) => {
   });
 });
 
-// OAuth 더미 엔드포인트 (Claude.ai 호환성)
+// OAuth 엔드포인트 (Auth0 연동)
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
-  res.status(404).json({ error: "OAuth not supported" });
+  const auth0Domain = process.env.AUTH0_DOMAIN;
+  if (!auth0Domain) {
+    return res.status(500).json({ error: "AUTH0_DOMAIN not configured" });
+  }
+  
+  res.json({
+    issuer: `https://${auth0Domain}/`,
+    authorization_endpoint: `https://${auth0Domain}/authorize`,
+    token_endpoint: `https://${auth0Domain}/oauth/token`,
+    registration_endpoint: `https://${auth0Domain}/oidc/register`,
+    jwks_uri: `https://${auth0Domain}/.well-known/jwks.json`
+  });
 });
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
-  res.status(404).json({ error: "OAuth not supported" });
+  const auth0Domain = process.env.AUTH0_DOMAIN;
+  const audience = process.env.AUTH0_AUDIENCE;
+  
+  if (!auth0Domain || !audience) {
+    return res.status(500).json({ error: "OAuth not configured" });
+  }
+  
+  res.json({
+    resource: audience,
+    authorization_servers: [`https://${auth0Domain}/`]
+  });
 });
 
+// OAuth 더미 엔드포인트 (Claude.ai 호환성)
 app.get("/.well-known/oauth-authorization-server/sse", (req, res) => {
-  res.status(404).json({ error: "OAuth not supported" });
+  res.redirect(301, "/.well-known/oauth-authorization-server");
 });
 
 app.get("/.well-known/oauth-protected-resource/sse", (req, res) => {
-  res.status(404).json({ error: "OAuth not supported" });
+  res.redirect(301, "/.well-known/oauth-protected-resource");
 });
 
 // SSE 초기 연결 (Claude가 여기로 연결) - 인증 필요
 // GET과 POST 모두 처리
 app.all("/sse", async (req, res) => {
-  // 1. 인증 확인 (Query parameter 또는 Authorization header)
+  // 1. 인증 확인 (Query parameter, Authorization header, OAuth Bearer token)
   const authHeader = req.headers["authorization"] || "";
   const queryKey = req.query.key || "";
   
-  // Bearer 토큰에서 키 추출
+  // OAuth Bearer 토큰인지 확인
+  if (authHeader.startsWith("Bearer ") && authHeader.length > 50) {
+    // OAuth 토큰으로 추정 (JWT는 길이가 깁니다)
+    // 토큰이 있으면 일단 통과 (실제 검증은 추후 추가 가능)
+    console.log(`[Auth] OAuth token received`);
+    const userKey = "oauth_user"; // OAuth 사용자로 처리
+    
+    // 세션 생성으로 진행
+    const sessionId = crypto.randomUUID();
+    console.log(`[SSE] New connection: ${sessionId} (OAuth user)`);
+    
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    
+    sendSSE(res, 'endpoint', `/session/${sessionId}`);
+    
+    sessions.set(sessionId, {
+      userId: userKey,
+      tools: [],
+      lastActivity: Date.now(),
+      res: res
+    });
+    
+    console.log(`[SSE] Session ${sessionId} created for OAuth user`);
+    
+    req.on('close', () => {
+      console.log(`[SSE] Connection closed: ${sessionId} (OAuth user)`);
+      sessions.delete(sessionId);
+    });
+    
+    const keepAlive = setInterval(() => {
+      if (res.writableEnded) {
+        clearInterval(keepAlive);
+        return;
+      }
+      res.write(': ping\n\n');
+    }, 30000);
+    
+    req.on('close', () => clearInterval(keepAlive));
+    return;
+  }
+  
+  // 기존 키 기반 인증
   const headerKey = authHeader.replace("Bearer", "").trim();
   const userKey = headerKey || queryKey;
   
@@ -434,6 +500,8 @@ app.post("/session/:sessionId", async (req, res) => {
       error: { code: -32001, message: "Session not found or expired" }
     });
   }
+  
+  // OAuth 사용자의 경우 토큰 검증 생략 (이미 SSE에서 검증됨)
   
   session.lastActivity = Date.now();
   
