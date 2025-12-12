@@ -187,12 +187,25 @@ app.get("/.well-known/oauth-protected-resource/sse", (req, res) => res.json(RESO
 
 
 // ========== Routes ==========
-
+// [수정] POST 요청 처리 (Auth0 토큰 OR 간단한 키 인증)
 app.post("/sse", async (req, res) => {
   const authHeader = req.headers["authorization"] || "";
   // Token check logging only
 
-  // 1. Initialize 요청: 즉시 응답
+  // // Gemini 용 비번 
+  // const apiKey = req.query.key; // URL 뒤에 ?key=... 로 들어오는 값 확인
+  // const MY_SECRET_KEY = process.env.MCP_SECRET_KEY; // Railway 변수에 설정할 비번
+
+  // // 1. 보안 검사: 토큰도 없고, 비밀키도 틀리면 차단
+  // const isAuth0 = authHeader.startsWith("Bearer ");
+  // const isKeyValid = MY_SECRET_KEY && apiKey === MY_SECRET_KEY;
+
+  // if (!isAuth0 && !isKeyValid) {
+  //   console.log("[Auth] Blocked: No valid token or key");
+  //   return res.status(401).json({ error: "Unauthorized" });
+  // }
+
+  // 2. Initialize 요청: 즉시 응답
   if (req.body && req.body.method === "initialize") {
     console.log("[POST/sse] Handling Initialization");
     return res.json({
@@ -272,6 +285,72 @@ app.get("/sse", (req, res) => {
   const keepAlive = setInterval(() => res.write(": ping\n\n"), 15000);
   req.on('close', () => clearInterval(keepAlive));
 });
+
+
+// [NEW] ChatGPT GPTs용 전용 엔드포인트 (REST API)
+app.post("/gpt/execute", async (req, res) => {
+  // 1. ChatGPT는 toolName과 arguments를 JSON으로 보냄
+  const { toolName, arguments: args } = req.body;
+  
+  // 인증 체크 (Auth0 토큰이 헤더로 들어옴)
+  const authHeader = req.headers["authorization"] || "";
+  if (!authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  console.log(`[GPT] Request: ${toolName}`);
+
+  try {
+    // 2. n8n 연결 확인
+    const n8n = await ensureN8nGlobalConnection();
+    if (!n8n || !n8n.sessionUrl) throw new Error("n8n connection unavailable");
+
+    // 3. MCP JSON-RPC 포맷으로 변환 ("통역")
+    const rpcId = crypto.randomUUID();
+    const payload = {
+      jsonrpc: "2.0",
+      id: rpcId,
+      method: "tools/call",
+      params: {
+        name: toolName,
+        arguments: args || {}
+      }
+    };
+
+    // 4. n8n에 전송
+    await fetch(n8n.sessionUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
+      body: JSON.stringify(payload)
+    });
+
+    // 5. 답이 올 때까지 기다림 (Sync Bridge 재사용)
+    const n8nResponse = await new Promise((resolve, reject) => {
+      responseWaiters.set(rpcId, resolve);
+      setTimeout(() => {
+        if (responseWaiters.has(rpcId)) {
+          responseWaiters.delete(rpcId);
+          reject(new Error("Timeout"));
+        }
+      }, 30000);
+    });
+
+    // 6. 결과 반환 (ChatGPT가 이해하기 쉽게 content만 추출)
+    if (n8nResponse.result && n8nResponse.result.content) {
+        // 텍스트 결과만 깔끔하게 보냄
+        const textContent = n8nResponse.result.content.map(c => c.text).join("\n");
+        return res.json({ result: textContent });
+    } else {
+        return res.json({ result: JSON.stringify(n8nResponse) });
+    }
+
+  } catch (e) {
+    console.error(`[GPT Error] ${e.message}`);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ... app.listen ...
 
 const port = process.env.PORT || 3000;
 app.listen(port, "0.0.0.0", () => {
