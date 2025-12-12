@@ -1,4 +1,4 @@
-// Remote MCP Server for Claude.ai (Sync Bridge Mode)
+// Remote MCP Server for Claude.ai (Robust Parser)
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 if (!isRailway) {
   try {
@@ -14,11 +14,10 @@ const app = express();
 app.use(express.json({ limit: "50mb" }));
 app.use(cors());
 
-// 디버깅: 요청 내용 로깅
+// 디버깅: 요청 로깅
 app.use((req, res, next) => {
   if (req.path === "/" || req.path === "/favicon.ico") return next();
   if (req.path === "/sse" && req.method === "POST") {
-    // 본문 내용은 너무 길면 자름
     const bodySnippet = JSON.stringify(req.body).substring(0, 100);
     console.log(`[HTTP] POST /sse Payload: ${bodySnippet}...`);
   } else {
@@ -27,16 +26,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// ========== 설정 ==========
 const N8N_MCP_URL = process.env.N8N_MCP_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
-
-// ========== 동기화 브릿지 (Sync Bridge) ==========
-// 요청 ID -> Promise Resolver 맵핑
-// n8n에서 응답이 오면 이 맵에서 찾아서 HTTP 응답을 즉시 보냄
 const responseWaiters = new Map();
 
-// ========== n8n 연결 관리 (Promise Singleton) ==========
+// ========== n8n 연결 관리 ==========
 let n8nGlobalSession = null;
 let n8nConnectionPromise = null;
 
@@ -62,16 +56,17 @@ async function ensureN8nGlobalConnection() {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      
       let buffer = "";
       let sessionUrl = null;
 
-      // Endpoint 찾기
+      // 1. Endpoint 찾기 (초기 핸드셰이크)
       while (!sessionUrl) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
-        buffer = lines.pop();
+        buffer = lines.pop(); // 마지막 불완전한 라인 보관
 
         for (const line of lines) {
           if (line.trim().startsWith("event: endpoint")) {
@@ -87,7 +82,7 @@ async function ensureN8nGlobalConnection() {
       if (!sessionUrl) throw new Error("Could not find n8n endpoint");
       console.log(`[n8n] Endpoint Found: ${sessionUrl}`);
 
-      // Initialize N8N Session
+      // Initialize Call (내부적으로 세션 활성화)
       await fetch(sessionUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
@@ -97,33 +92,56 @@ async function ensureN8nGlobalConnection() {
         })
       });
 
-      // Background Listener (브릿지 핵심)
+      // 2. 강력해진 스트림 리스너 (백그라운드)
       (async () => {
+        let currentEventData = ""; // 여러 줄의 data를 합칠 변수
+        
         try {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split("\n");
             
+            const chunk = decoder.decode(value, { stream: true });
+            
+            // [디버깅] 들어오는 데이터가 뭔지 살짝 보기 (너무 길면 자름)
+            // console.log(`[Stream Chunk] ${chunk.length} bytes received`);
+
+            buffer += chunk;
+            const lines = buffer.split("\n");
+            buffer = lines.pop(); // 다음 청크를 위해 마지막 조각 보관
+
             for (const line of lines) {
               const trimmed = line.trim();
+
+              // SSE 이벤트 처리 로직 개선
               if (trimmed.startsWith("data: ")) {
-                const jsonStr = trimmed.replace("data: ", "").trim();
-                if (jsonStr && jsonStr !== "[DONE]") {
-                  try {
-                    const msg = JSON.parse(jsonStr);
-                    
-                    // [핵심] 기다리고 있는 HTTP 요청이 있는지 확인
-                    if (msg.id && responseWaiters.has(msg.id)) {
-                      const resolve = responseWaiters.get(msg.id);
-                      resolve(msg); // 약속 이행! (HTTP 응답 발송)
-                      responseWaiters.delete(msg.id);
-                      console.log(`[Bridge] Matched response for ID ${msg.id}`);
+                // 'data: ' 접두사 제거하고 내용만 누적
+                currentEventData += line.substring(6); 
+              } else if (trimmed === "") {
+                // 빈 줄(\n\n)은 이벤트의 끝을 의미 -> 파싱 시도
+                if (currentEventData) {
+                  if (currentEventData !== "[DONE]") {
+                    try {
+                      const msg = JSON.parse(currentEventData);
+                      
+                      // 기다리던 요청인지 확인
+                      if (msg.id && responseWaiters.has(msg.id)) {
+                        console.log(`[Bridge] ✅ Matched response for ID ${msg.id}`);
+                        const resolve = responseWaiters.get(msg.id);
+                        resolve(msg);
+                        responseWaiters.delete(msg.id);
+                      } else {
+                        // console.log(`[Stream] Ignored message ID: ${msg.id}`);
+                      }
+                    } catch (e) {
+                      console.error(`[Parse Error] Failed to parse JSON: ${e.message}`);
+                      // console.error(`Bad Data: ${currentEventData.substring(0, 100)}...`);
                     }
-                  } catch (e) {}
+                  }
+                  currentEventData = ""; // 초기화
                 }
               }
+              // event: ... 라인은 무시해도 됨 (data만 중요)
             }
           }
         } catch (e) {
@@ -170,13 +188,9 @@ app.get("/.well-known/oauth-protected-resource/sse", (req, res) => res.json(RESO
 
 // ========== Routes ==========
 
-// [최종 수정] HTTP POST 핸들러 (동기식 대기 모드)
 app.post("/sse", async (req, res) => {
-  // 토큰 로그만 찍고 넘어감 (Claude가 안 보내는 경우가 많아서 강제하면 안됨)
   const authHeader = req.headers["authorization"] || "";
-  if (!authHeader.startsWith("Bearer ")) {
-    // console.log("[POST/sse] No Token provided (Proceeding anyway)");
-  }
+  // Token check logging only
 
   // 1. Initialize 요청: 즉시 응답
   if (req.body && req.body.method === "initialize") {
@@ -192,9 +206,8 @@ app.post("/sse", async (req, res) => {
     });
   }
 
-  // 2. 알림(Notifications): 응답 기다릴 필요 없음
+  // 2. 알림(Notifications): 비동기 처리
   if (req.body && req.body.method && req.body.method.startsWith("notifications/")) {
-     // n8n으로 쏘고 잊어버림
      ensureN8nGlobalConnection().then(n8n => {
         if(n8n && n8n.sessionUrl) {
             fetch(n8n.sessionUrl, {
@@ -207,36 +220,32 @@ app.post("/sse", async (req, res) => {
      return res.status(200).send("OK");
   }
 
-  // 3. 도구 실행/목록 (tools/list, tools/call) -> 응답을 기다려야 함!
+  // 3. 도구 실행/목록: 응답 대기 (Sync Bridge)
   if (req.body && req.body.id) {
     try {
       const n8n = await ensureN8nGlobalConnection();
       if (!n8n || !n8n.sessionUrl) throw new Error("n8n connection unavailable");
 
-      console.log(`[Bridge] Relaying ${req.body.method} (ID: ${req.body.id}) - Waiting for response...`);
+      console.log(`[Bridge] Relaying ${req.body.method} (ID: ${req.body.id}) - Waiting...`);
 
-      // n8n에 요청 전송
+      // n8n 전송
       await fetch(n8n.sessionUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
         body: JSON.stringify(req.body)
       });
 
-      // [핵심] n8n이 답을 줄 때까지 Promise로 기다림 (최대 25초 타임아웃)
+      // 응답 대기 (30초 타임아웃)
       const n8nResponse = await new Promise((resolve, reject) => {
-        // 대기열에 등록
         responseWaiters.set(req.body.id, resolve);
-        
-        // 타임아웃 설정 (Railway/Claude 타임아웃 방지)
         setTimeout(() => {
           if (responseWaiters.has(req.body.id)) {
             responseWaiters.delete(req.body.id);
             reject(new Error("Timeout waiting for n8n response"));
           }
-        }, 25000); // 25초
+        }, 30000);
       });
 
-      // 답이 오면 바로 JSON으로 반환! (이게 Claude가 원하는 것)
       return res.json(n8nResponse);
 
     } catch(e) {
@@ -252,7 +261,6 @@ app.post("/sse", async (req, res) => {
   return res.status(200).send("OK");
 });
 
-// SSE Connection (GET) - 혹시 모르니 살려두지만, 필수는 아님
 app.get("/sse", (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
