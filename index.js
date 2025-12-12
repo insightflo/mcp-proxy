@@ -1,4 +1,4 @@
-// Remote MCP Server for Claude.ai (Fixed Compatibility)
+// Remote MCP Server for Claude.ai (Direct Response Fix)
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 if (!isRailway) {
   try {
@@ -11,18 +11,27 @@ const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
+// Body parser 크기 제한 설정
 app.use(express.json({ limit: "50mb" }));
+// CORS 모든 요청 허용
 app.use(cors());
 
-// ========== 세션 저장소 ==========
+// 디버깅을 위한 미들웨어: 모든 요청 로그 찍기
+app.use((req, res, next) => {
+  // 헬스체크나 favicon은 로그 제외
+  if (req.path !== "/" && req.path !== "/favicon.ico") {
+    console.log(`[HTTP] ${req.method} ${req.path}`);
+  }
+  next();
+});
+
+// ========== 세션 및 n8n 설정 ==========
 const sessions = new Map();
 const pendingRequests = new Map();
-
-// ========== n8n 설정 ==========
 const N8N_MCP_URL = process.env.N8N_MCP_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 
-// ========== n8n Global Connection ==========
+// ========== n8n 연결 관리 (Stateless) ==========
 let n8nGlobalSession = null;
 let n8nConnecting = false;
 
@@ -87,7 +96,7 @@ async function ensureN8nGlobalConnection() {
       })
     });
 
-    // 3. Listener
+    // 3. Listener (Background)
     (async () => {
       try {
         while (true) {
@@ -103,6 +112,7 @@ async function ensureN8nGlobalConnection() {
               if (jsonStr && jsonStr !== "[DONE]") {
                 try {
                   const msg = JSON.parse(jsonStr);
+                  // JSON-RPC 응답 전달
                   const sessionId = pendingRequests.get(msg.id);
                   if (sessionId) {
                     const session = sessions.get(sessionId);
@@ -135,6 +145,7 @@ async function ensureN8nGlobalConnection() {
   }
 }
 
+// SSE 전송 헬퍼
 function sendSSE(res, event, data) {
   if (res.writableEnded) return;
   res.write(`event: ${event}\n`);
@@ -142,51 +153,47 @@ function sendSSE(res, event, data) {
   res.write(`data: ${payload}\n\n`);
 }
 
-// ========== Routes ==========
-app.get("/", (req, res) => res.send("Auth0 MCP Proxy"));
+// ========== Auth0 Metadata (JSON 직접 반환) ==========
 
-// [복구됨] Claude 호환성 엔드포인트 (중요!)
-// Claude가 '/sse' 경로에 대해서도 메타데이터를 확인하려 할 때 원본으로 리다이렉트
-app.get("/.well-known/oauth-authorization-server/sse", (req, res) => {
-  res.redirect(301, "/.well-known/oauth-authorization-server");
-});
+// 공통 JSON 데이터 정의
+const AUTH0_METADATA = {
+  issuer: `https://${process.env.AUTH0_DOMAIN}/`,
+  authorization_endpoint: `https://${process.env.AUTH0_DOMAIN}/authorize`,
+  token_endpoint: `https://${process.env.AUTH0_DOMAIN}/oauth/token`,
+  registration_endpoint: `https://${process.env.AUTH0_DOMAIN}/oidc/register`,
+  jwks_uri: `https://${process.env.AUTH0_DOMAIN}/.well-known/jwks.json`
+};
 
-app.get("/.well-known/oauth-protected-resource/sse", (req, res) => {
-  res.redirect(301, "/.well-known/oauth-protected-resource");
-});
+const RESOURCE_METADATA = {
+  resource: process.env.AUTH0_AUDIENCE,
+  authorization_servers: [`https://${process.env.AUTH0_DOMAIN}/`]
+};
 
-// Auth0 Configuration
-app.get("/.well-known/oauth-authorization-server", (req, res) => {
-  res.json({
-    issuer: `https://${process.env.AUTH0_DOMAIN}/`,
-    authorization_endpoint: `https://${process.env.AUTH0_DOMAIN}/authorize`,
-    token_endpoint: `https://${process.env.AUTH0_DOMAIN}/oauth/token`,
-    registration_endpoint: `https://${process.env.AUTH0_DOMAIN}/oidc/register`,
-    jwks_uri: `https://${process.env.AUTH0_DOMAIN}/.well-known/jwks.json`
-  });
-});
+// 원본 경로
+app.get("/.well-known/oauth-authorization-server", (req, res) => res.json(AUTH0_METADATA));
+app.get("/.well-known/oauth-protected-resource", (req, res) => res.json(RESOURCE_METADATA));
 
-app.get("/.well-known/oauth-protected-resource", (req, res) => {
-  res.json({
-    resource: process.env.AUTH0_AUDIENCE,
-    authorization_servers: [`https://${process.env.AUTH0_DOMAIN}/`]
-  });
-});
+// [수정됨] Claude 호환 경로 (Redirect 대신 직접 응답)
+app.get("/.well-known/oauth-authorization-server/sse", (req, res) => res.json(AUTH0_METADATA));
+app.get("/.well-known/oauth-protected-resource/sse", (req, res) => res.json(RESOURCE_METADATA));
 
-// SSE Connection
-app.all("/sse", (req, res) => {
-  if (req.method !== 'GET') {
-    return res.status(200).send("OK");
-  }
 
+// ========== SSE Connection (GET Only) ==========
+// POST /sse가 오면 그냥 무시 (Claude의 찔러보기 방지)
+app.post("/sse", (req, res) => res.status(200).send("OK"));
+
+app.get("/sse", (req, res) => {
   const authHeader = req.headers["authorization"] || "";
+  
   if (!authHeader.startsWith("Bearer ")) {
-    console.log("[Auth] Missing Token");
-    return res.status(401).json({ error: "Unauthorized" });
+    console.log("[Auth] Failed: No Token");
+    // 브라우저 등에서 접속 시 안내 메시지
+    return res.status(401).json({ error: "Unauthorized", message: "Bearer token required" });
   }
 
-  console.log("[Auth] Token Accepted");
+  console.log("[Auth] Success: Token Received");
 
+  // SSE 헤더 설정 (버퍼링 방지 포함)
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -194,14 +201,17 @@ app.all("/sse", (req, res) => {
     'X-Accel-Buffering': 'no'
   });
 
+  // 연결 즉시 데이터 전송
   res.write(": welcome\n\n");
 
   const sessionId = crypto.randomUUID();
   sessions.set(sessionId, { connectedAt: Date.now(), res: res });
-  console.log(`[SSE] Session: ${sessionId}`);
+  console.log(`[SSE] Session Created: ${sessionId}`);
 
+  // Endpoint 전송 (따옴표 없이!)
   sendSSE(res, 'endpoint', `/session/${sessionId}`);
 
+  // Keep-alive ping
   const pinger = setInterval(() => res.write(": ping\n\n"), 15000);
 
   req.on('close', () => {
@@ -211,29 +221,30 @@ app.all("/sse", (req, res) => {
   });
 });
 
-// JSON-RPC Handling
+// ========== JSON-RPC Handling ==========
 app.post("/session/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
 
-  if (!session) {
-    return res.status(404).json({ error: "Session not found" });
-  }
+  if (!session) return res.status(404).json({ error: "Session not found" });
 
   const { id, method } = req.body;
   console.log(`[RPC] ${method} (${sessionId})`);
 
   try {
     const n8n = await ensureN8nGlobalConnection();
+    
+    // 응답 라우팅 등록
     pendingRequests.set(id, sessionId);
 
+    // n8n 전송
     const response = await fetch(n8n.sessionUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
       body: JSON.stringify(req.body)
     });
 
-    if (!response.ok) throw new Error("n8n relay failed");
+    if (!response.ok) throw new Error("Backend error");
     res.status(202).end();
 
   } catch (error) {
@@ -242,7 +253,9 @@ app.post("/session/:sessionId", async (req, res) => {
   }
 });
 
+app.get("/", (req, res) => res.send("Auth0 MCP Proxy Active"));
+
 const port = process.env.PORT || 3000;
 app.listen(port, "0.0.0.0", () => {
-  console.log(`✅ Proxy running on port ${port}`);
+  console.log(`✅ Server running on port ${port}`);
 });
