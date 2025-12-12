@@ -12,6 +12,7 @@ const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true })); // [추가] ChatGPT는 Form 데이터로 요청함
 app.use(cors());
 
 // 디버깅: 요청 로깅
@@ -347,6 +348,48 @@ app.post("/gpt/execute", async (req, res) => {
   } catch (e) {
     console.error(`[GPT Error] ${e.message}`);
     return res.status(500).json({ error: e.message });
+  }
+});
+
+// ========== [NEW] ChatGPT용 인증 프록시 (Auth0 중계) ==========
+
+// 1. 로그인 요청 (Redirect)
+app.get("/auth/authorize", (req, res) => {
+  // ChatGPT가 보낸 요청을 그대로 Auth0로 전달 (쿼리 파라미터 유지)
+  const params = new URLSearchParams(req.query);
+  // redirect_uri는 Auth0에 등록된 것(railway 주소)이어야 함. 
+  // ChatGPT가 보낸 redirect_uri는 잠시 무시하거나, state에 태워야 할 수도 있지만
+  // 보통 Auth0 설정을 따르므로 여기서는 Auth0의 Authorize URL로 바로 점프합니다.
+  
+  const auth0Url = `https://${process.env.AUTH0_DOMAIN}/authorize?${params.toString()}`;
+  res.redirect(auth0Url);
+});
+
+// 2. 토큰 교환 요청 (Proxy)
+app.post("/auth/token", async (req, res) => {
+  try {
+    // ChatGPT는 code를 Form Data로 보냄
+    const { code, redirect_uri, grant_type } = req.body;
+    
+    // Railway -> Auth0로 대신 요청
+    const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: process.env.AUTH0_CLIENT_ID,
+        client_secret: process.env.AUTH0_CLIENT_SECRET,
+        code: code,
+        grant_type: "authorization_code",
+        redirect_uri: redirect_uri // ChatGPT가 준 주소 그대로 전달
+      })
+    });
+
+    const data = await response.json();
+    res.json(data);
+    
+  } catch (e) {
+    console.error("[Token Proxy Error]", e);
+    res.status(500).json({ error: "Token exchange failed" });
   }
 });
 
