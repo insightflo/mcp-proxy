@@ -1,4 +1,4 @@
-// Remote MCP Server for Claude.ai (Final Fix)
+// Remote MCP Server for Claude.ai (Fixed Compatibility)
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 if (!isRailway) {
   try {
@@ -22,7 +22,7 @@ const pendingRequests = new Map();
 const N8N_MCP_URL = process.env.N8N_MCP_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 
-// ========== n8n Global Connection (Stateless) ==========
+// ========== n8n Global Connection ==========
 let n8nGlobalSession = null;
 let n8nConnecting = false;
 
@@ -55,7 +55,7 @@ async function ensureN8nGlobalConnection() {
     let buffer = "";
     let sessionUrl = null;
 
-    // 1. Find Endpoint
+    // 1. Endpoint 찾기
     while (!sessionUrl) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -107,7 +107,6 @@ async function ensureN8nGlobalConnection() {
                   if (sessionId) {
                     const session = sessions.get(sessionId);
                     if (session && session.res) {
-                      // 메시지는 객체이므로 stringify 해서 보냄
                       sendSSE(session.res, 'message', JSON.stringify(msg));
                     }
                     pendingRequests.delete(msg.id);
@@ -136,12 +135,9 @@ async function ensureN8nGlobalConnection() {
   }
 }
 
-// ========== SSE Helper (수정됨) ==========
 function sendSSE(res, event, data) {
   if (res.writableEnded) return;
   res.write(`event: ${event}\n`);
-  // 데이터가 이미 문자열이면 그대로, 객체면 stringify
-  // endpoint 이벤트일 때 따옴표가 중복되는 것을 방지
   const payload = typeof data === 'string' ? data : JSON.stringify(data);
   res.write(`data: ${payload}\n\n`);
 }
@@ -149,7 +145,17 @@ function sendSSE(res, event, data) {
 // ========== Routes ==========
 app.get("/", (req, res) => res.send("Auth0 MCP Proxy"));
 
-// Auth0 Endpoints
+// [복구됨] Claude 호환성 엔드포인트 (중요!)
+// Claude가 '/sse' 경로에 대해서도 메타데이터를 확인하려 할 때 원본으로 리다이렉트
+app.get("/.well-known/oauth-authorization-server/sse", (req, res) => {
+  res.redirect(301, "/.well-known/oauth-authorization-server");
+});
+
+app.get("/.well-known/oauth-protected-resource/sse", (req, res) => {
+  res.redirect(301, "/.well-known/oauth-protected-resource");
+});
+
+// Auth0 Configuration
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
     issuer: `https://${process.env.AUTH0_DOMAIN}/`,
@@ -168,10 +174,8 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => {
 });
 
 // SSE Connection
-// GET과 POST 모두 처리 (POST /sse 404 방지)
 app.all("/sse", (req, res) => {
   if (req.method !== 'GET') {
-    // Claude가 간혹 POST로 찔러볼 때가 있음. 200 OK 주고 끝냄.
     return res.status(200).send("OK");
   }
 
@@ -196,8 +200,6 @@ app.all("/sse", (req, res) => {
   sessions.set(sessionId, { connectedAt: Date.now(), res: res });
   console.log(`[SSE] Session: ${sessionId}`);
 
-  // [중요 수정] JSON.stringify 없이 생 문자열로 보냄
-  // 결과: data: /session/uuid
   sendSSE(res, 'endpoint', `/session/${sessionId}`);
 
   const pinger = setInterval(() => res.write(": ping\n\n"), 15000);
@@ -215,7 +217,6 @@ app.post("/session/:sessionId", async (req, res) => {
   const session = sessions.get(sessionId);
 
   if (!session) {
-    console.log(`[RPC] Session Not Found: ${sessionId}`);
     return res.status(404).json({ error: "Session not found" });
   }
 
