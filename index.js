@@ -1,4 +1,4 @@
-// Remote MCP Server for Claude.ai (Stateless Support)
+// Remote MCP Server for Claude.ai (Notification Fix)
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 if (!isRailway) {
   try {
@@ -29,7 +29,7 @@ const N8N_API_KEY = process.env.N8N_API_KEY || "";
 class N8nSession {
   constructor(sessionId, res) {
     this.sessionId = sessionId;
-    this.clientRes = res; // SSE 응답용 (없으면 null)
+    this.clientRes = res; 
     this.n8nSessionUrl = null;
     this.controller = new AbortController();
     this.responseWaiters = new Map(); 
@@ -39,7 +39,6 @@ class N8nSession {
   }
 
   async connect() {
-    // console.log(`[Session ${this.sessionId}] Connecting to n8n...`);
     try {
       const response = await fetch(N8N_MCP_URL, {
         method: "GET",
@@ -97,7 +96,6 @@ class N8nSession {
     } else if (this.expectingEndpointData && line.startsWith("data: ")) {
       const relativePath = line.replace("data: ", "").trim();
       this.n8nSessionUrl = new URL(relativePath, N8N_MCP_URL).toString();
-      // console.log(`[Session ${this.sessionId}] Endpoint Locked`);
       this.expectingEndpointData = false;
       
       this.sendToN8n({
@@ -110,13 +108,11 @@ class N8nSession {
       if (jsonStr && jsonStr !== "[DONE]") {
         try {
           const msg = JSON.parse(jsonStr);
-          // A. 동기 대기자(Sync Waiter)가 있으면 그쪽으로 응답 (가장 우선)
           if (msg.id && this.responseWaiters.has(msg.id)) {
             const resolve = this.responseWaiters.get(msg.id);
             resolve(msg);
             this.responseWaiters.delete(msg.id);
           } 
-          // B. 아니면 SSE로 전송
           else if (this.clientRes) {
              this.sendSSEToClient('message', msg);
           }
@@ -133,16 +129,16 @@ class N8nSession {
   }
 
   async sendToN8n(payload) {
-    // Endpoint 확보 대기
     if (!this.n8nSessionUrl) {
       let attempts = 0;
-      while (!this.n8nSessionUrl && attempts < 50) { // 5초 대기
+      while (!this.n8nSessionUrl && attempts < 50) { 
         await new Promise(r => setTimeout(r, 100));
         attempts++;
       }
       if (!this.n8nSessionUrl) throw new Error("n8n session endpoint not ready");
     }
 
+    // Fire and Forget (결과 안 기다림)
     await fetch(this.n8nSessionUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
@@ -150,7 +146,6 @@ class N8nSession {
     });
   }
 
-  // 응답이 올 때까지 기다리는 함수 (Sync Bridge)
   async sendToN8nAndWait(payload) {
     await this.sendToN8n(payload);
     return new Promise((resolve, reject) => {
@@ -160,7 +155,7 @@ class N8nSession {
           this.responseWaiters.delete(payload.id);
           reject(new Error("Timeout waiting for n8n response"));
         }
-      }, 30000); // 30초
+      }, 30000); 
     });
   }
 
@@ -173,10 +168,12 @@ class N8nSession {
 
 const sessions = new Map();
 
-// ========== [공통 핸들러: 만능 해결사] ==========
+// ========== [공통 핸들러] ==========
 const handleMcpPost = async (req, res) => {
-  // 1. 초기화 요청
-  if (req.body && req.body.method === "initialize") {
+  const method = req.body?.method;
+
+  // 1. 초기화 (Handshake)
+  if (method === "initialize") {
     console.log("[POST] Initialization Request");
     return res.json({
       jsonrpc: "2.0", id: req.body.id,
@@ -188,10 +185,31 @@ const handleMcpPost = async (req, res) => {
     });
   }
 
-  // 2. 그 외 요청 (tools/list 등)
-  if (req.body && req.body.method) {
+  // 2. [핵심 수정] 알림(Notification)은 답을 기다리지 않고 즉시 OK
+  // notifications/initialized 같은 게 여기에 해당됨
+  if (method && (method.startsWith("notifications/") || !req.body.id)) {
+    console.log(`[POST] Notification: ${method} (Skipping Wait)`);
+    
+    // 백그라운드에서 n8n에 전달만 해둠 (실패해도 상관없음)
+    (async () => {
+      try {
+        const lastSessionId = Array.from(sessions.keys()).pop();
+        if (lastSessionId) {
+            await sessions.get(lastSessionId).sendToN8n(req.body);
+        } else {
+            // 세션 없으면 굳이 1회용 세션 만들어서 보낼 필요도 없음 (어차피 답 없으니까)
+            // console.log("Skipping notification relay (no session)");
+        }
+      } catch (e) {}
+    })();
+
+    return res.status(200).send("OK");
+  }
+
+  // 3. 일반 요청 (tools/list 등) - 답을 기다려야 함
+  if (method) {
     try {
-      // 전략 A: 이미 연결된 SSE 세션이 있으면 거기로 보냄 (가장 빠름)
+      // A. 기존 세션 사용
       const lastSessionId = Array.from(sessions.keys()).pop();
       if (lastSessionId) {
         const session = sessions.get(lastSessionId);
@@ -199,25 +217,18 @@ const handleMcpPost = async (req, res) => {
         return res.status(202).end();
       } 
       
-      // [핵심 추가] 전략 B: 연결된 세션이 없으면? "1회용 세션"을 만들어서 처리 (Stateless)
-      // 친구분이 이 케이스에 해당합니다.
-      console.log(`[POST] No active session. Creating transient session for ${req.body.method}...`);
+      // B. 1회용 세션 (친구분 케이스)
+      console.log(`[POST] No active session. Creating transient session for ${method}...`);
       
       const tempId = `temp-${crypto.randomUUID()}`;
-      const tempSession = new N8nSession(tempId, null); // SSE 응답 없음
+      const tempSession = new N8nSession(tempId, null);
 
       try {
-        // n8n 연결될 때까지 잠시 대기
         await new Promise(r => setTimeout(r, 1000));
-        
-        // 요청 보내고 답 기다림 (Sync Mode)
         const response = await tempSession.sendToN8nAndWait(req.body);
-        
-        // 답을 HTTP로 바로 반환
         return res.json(response);
 
       } finally {
-        // 볼일 끝났으니 연결 종료
         tempSession.close();
       }
 
@@ -260,7 +271,6 @@ const handleSseConnection = (req, res) => {
 
 // ========== Routes ==========
 
-// 1. Root 경로
 app.get("/", (req, res) => {
   if (req.headers.accept && req.headers.accept.includes("text/event-stream")) {
     return handleSseConnection(req, res);
@@ -269,11 +279,9 @@ app.get("/", (req, res) => {
 });
 app.post("/", handleMcpPost); 
 
-// 2. /sse 경로
 app.get("/sse", handleSseConnection);
 app.post("/sse", handleMcpPost);
 
-// 3. Session 경로
 app.post("/session/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
@@ -286,7 +294,6 @@ app.post("/session/:sessionId", async (req, res) => {
   }
 });
 
-// 4. GPTs용 엔드포인트 (기존 로직 재사용)
 app.post("/gpt/execute", async (req, res) => {
   const { toolName, arguments: args } = req.body;
   const tempId = `gpt-${crypto.randomUUID()}`;
@@ -313,7 +320,7 @@ app.post("/gpt/execute", async (req, res) => {
   }
 });
 
-// 5. Auth0 Proxy
+// Auth0 Proxy
 app.get("/auth/authorize", (req, res) => {
   const params = new URLSearchParams(req.query);
   const auth0Url = `https://${process.env.AUTH0_DOMAIN}/authorize?${params.toString()}`;
@@ -340,7 +347,6 @@ app.post("/auth/token", async (req, res) => {
   }
 });
 
-// Auth0 Metadata
 const AUTH0_METADATA = {
   issuer: `https://${process.env.AUTH0_DOMAIN}/`,
   authorization_endpoint: `https://${process.env.AUTH0_DOMAIN}/authorize`,
@@ -353,5 +359,5 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => res.json({ resour
 
 const port = process.env.PORT || 3000;
 app.listen(port, "0.0.0.0", () => {
-  console.log(`✅ Stateless Universal Server running on port ${port}`);
+  console.log(`✅ Final Server running on port ${port}`);
 });
