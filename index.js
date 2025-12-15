@@ -1,4 +1,4 @@
-// Remote MCP Server for Claude.ai (Multi-User + Legacy Route Support)
+// Remote MCP Server for Claude.ai (Universal Route Support)
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 if (!isRailway) {
   try {
@@ -9,7 +9,7 @@ if (!isRailway) {
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-// undici가 설치되어 있어야 합니다 (package.json 확인)
+// package.json에 undici가 있어야 합니다.
 const { fetch } = require("undici"); 
 
 const app = express();
@@ -17,7 +17,7 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
-// 디버깅: 요청 로깅
+// 디버깅
 app.use((req, res, next) => {
   if (req.path === "/favicon.ico") return next();
   next();
@@ -26,7 +26,7 @@ app.use((req, res, next) => {
 const N8N_MCP_URL = process.env.N8N_MCP_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 
-// ========== N8n Session Class (사용자별 독립 연결) ==========
+// ========== N8n Session Class ==========
 class N8nSession {
   constructor(sessionId, res) {
     this.sessionId = sessionId;
@@ -173,15 +173,45 @@ class N8nSession {
 
 const sessions = new Map();
 
-// ========== Routes ==========
+// ========== [공통 핸들러] ==========
+// POST 요청 처리 로직 (Initialize 및 일반 요청)
+const handleMcpPost = async (req, res) => {
+  // A. 초기화 요청 (Initialize) -> 즉시 응답
+  if (req.body && req.body.method === "initialize") {
+    console.log("[POST] Initialization Request");
+    return res.json({
+      jsonrpc: "2.0",
+      id: req.body.id,
+      result: {
+        protocolVersion: "2024-11-05",
+        serverInfo: { name: "Stock Analysis MCP", version: "1.0.0" },
+        capabilities: { tools: {} }
+      }
+    });
+  }
 
-// Root Health Check
-app.get("/", (req, res) => {
-  res.send("MCP Server is Running! Please use /sse endpoint.");
-});
+  // B. 그 외 요청 (tools/list 등) -> 가장 최근 세션으로 전달 (Fallback)
+  if (req.body && req.body.method) {
+    try {
+      const lastSessionId = Array.from(sessions.keys()).pop();
+      if (lastSessionId) {
+        const session = sessions.get(lastSessionId);
+        await session.sendToN8n(req.body);
+        return res.status(202).end();
+      } else {
+        console.warn("[POST] No active session found");
+        return res.status(400).json({ error: "No active session" });
+      }
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  }
 
-// 1. Claude 연결 (GET /sse)
-app.get("/sse", (req, res) => {
+  res.status(200).send("OK");
+};
+
+// SSE 연결 처리 로직
+const handleSseConnection = (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -206,9 +236,26 @@ app.get("/sse", (req, res) => {
     sessions.delete(sessionId);
     console.log(`[Client Disconnected] ID: ${sessionId}`);
   });
-});
+};
 
-// 2. Claude 메시지 수신 (POST /session/:sessionId) - 표준 방식
+
+// ========== Routes ==========
+
+// 1. Root 경로 처리 (친구분이 /sse 없이 들어올 때)
+app.get("/", (req, res) => {
+  // 만약 브라우저가 아니라 SSE를 원하면 SSE로 연결해줌
+  if (req.headers.accept && req.headers.accept.includes("text/event-stream")) {
+    return handleSseConnection(req, res);
+  }
+  res.send("MCP Server is Running! Endpoint: /sse");
+});
+app.post("/", handleMcpPost); // [핵심] Root로 POST를 날려도 처리함!
+
+// 2. /sse 경로 처리 (정석)
+app.get("/sse", handleSseConnection);
+app.post("/sse", handleMcpPost);
+
+// 3. Session 경로 (표준)
 app.post("/session/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
@@ -219,48 +266,6 @@ app.post("/session/:sessionId", async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
-});
-
-// 3. [핵심 수정] 초기화 및 레거시 라우팅 (POST /sse)
-// Claude가 '/session/ID' 대신 그냥 '/sse'로 요청을 보낼 때 처리하는 로직
-app.post("/sse", async (req, res) => {
-  
-  // A. 초기화 요청인 경우 (항상 즉시 응답)
-  if (req.body && req.body.method === "initialize") {
-    return res.json({
-      jsonrpc: "2.0",
-      id: req.body.id,
-      result: {
-        protocolVersion: "2024-11-05",
-        serverInfo: { name: "Stock Analysis MCP", version: "1.0.0" },
-        capabilities: { tools: {} }
-      }
-    });
-  }
-
-  // B. 그 외 요청 (tools/list 등)인데 주소가 /sse인 경우
-  // -> 가장 최근에 접속한 세션을 찾아서 거기로 보냄 (Fallback)
-  if (req.body && req.body.method) {
-    try {
-      // 가장 마지막에 추가된 세션 ID 찾기
-      const lastSessionId = Array.from(sessions.keys()).pop();
-      
-      if (lastSessionId) {
-        const session = sessions.get(lastSessionId);
-        // console.log(`[Fallback] Relaying ${req.body.method} to session ${lastSessionId}`);
-        await session.sendToN8n(req.body);
-        return res.status(202).end();
-      } else {
-        console.warn("[Fallback] No active session found for POST /sse request");
-        // 세션이 없으면 어쩔 수 없이 에러
-        return res.status(400).json({ error: "No active session" });
-      }
-    } catch (e) {
-      return res.status(500).json({ error: e.message });
-    }
-  }
-
-  res.status(200).send("OK");
 });
 
 // 4. GPTs용 엔드포인트
@@ -333,5 +338,5 @@ app.get("/.well-known/oauth-protected-resource", (req, res) => res.json({ resour
 
 const port = process.env.PORT || 3000;
 app.listen(port, "0.0.0.0", () => {
-  console.log(`✅ Multi-User Server running on port ${port}`);
+  console.log(`✅ Universal Server running on port ${port}`);
 });
