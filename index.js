@@ -1,4 +1,4 @@
-// Remote MCP Server for Claude.ai (Multi-User + Root Fix)
+// Remote MCP Server for Claude.ai (Multi-User + Legacy Route Support)
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 if (!isRailway) {
   try {
@@ -17,10 +17,9 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cors());
 
-// 디버깅: 요청 로깅 (루트 경로 404 확인용)
+// 디버깅: 요청 로깅
 app.use((req, res, next) => {
   if (req.path === "/favicon.ico") return next();
-  // console.log(`[HTTP] ${req.method} ${req.path}`);
   next();
 });
 
@@ -169,7 +168,6 @@ class N8nSession {
       resolve({ error: "Session closed" });
     }
     this.responseWaiters.clear();
-    // console.log(`[Session ${this.sessionId}] Closed`);
   }
 }
 
@@ -177,16 +175,10 @@ const sessions = new Map();
 
 // ========== Routes ==========
 
-// [추가된 부분] Root Health Check (이게 없어서 404가 났음)
+// Root Health Check
 app.get("/", (req, res) => {
   res.send("MCP Server is Running! Please use /sse endpoint.");
 });
-
-// [추가된 부분] 혹시 Root로 POST를 날리는 클라이언트를 위한 안내
-app.post("/", (req, res) => {
-  res.status(400).send("Please use /sse endpoint for MCP communication.");
-});
-
 
 // 1. Claude 연결 (GET /sse)
 app.get("/sse", (req, res) => {
@@ -216,7 +208,7 @@ app.get("/sse", (req, res) => {
   });
 });
 
-// 2. Claude 메시지 수신 (POST /session/:sessionId)
+// 2. Claude 메시지 수신 (POST /session/:sessionId) - 표준 방식
 app.post("/session/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
@@ -229,8 +221,11 @@ app.post("/session/:sessionId", async (req, res) => {
   }
 });
 
-// 3. 초기화 (POST /sse) 
+// 3. [핵심 수정] 초기화 및 레거시 라우팅 (POST /sse)
+// Claude가 '/session/ID' 대신 그냥 '/sse'로 요청을 보낼 때 처리하는 로직
 app.post("/sse", async (req, res) => {
+  
+  // A. 초기화 요청인 경우 (항상 즉시 응답)
   if (req.body && req.body.method === "initialize") {
     return res.json({
       jsonrpc: "2.0",
@@ -242,6 +237,29 @@ app.post("/sse", async (req, res) => {
       }
     });
   }
+
+  // B. 그 외 요청 (tools/list 등)인데 주소가 /sse인 경우
+  // -> 가장 최근에 접속한 세션을 찾아서 거기로 보냄 (Fallback)
+  if (req.body && req.body.method) {
+    try {
+      // 가장 마지막에 추가된 세션 ID 찾기
+      const lastSessionId = Array.from(sessions.keys()).pop();
+      
+      if (lastSessionId) {
+        const session = sessions.get(lastSessionId);
+        // console.log(`[Fallback] Relaying ${req.body.method} to session ${lastSessionId}`);
+        await session.sendToN8n(req.body);
+        return res.status(202).end();
+      } else {
+        console.warn("[Fallback] No active session found for POST /sse request");
+        // 세션이 없으면 어쩔 수 없이 에러
+        return res.status(400).json({ error: "No active session" });
+      }
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  }
+
   res.status(200).send("OK");
 });
 
