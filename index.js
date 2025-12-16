@@ -108,30 +108,25 @@ function extractUserEmail(req) {
 }
 
 // [핵심] 인증 강제 미들웨어
+
 const requireAuth = (req, res, next) => {
-  // 예외 경로 (인증 없이 접근 가능해야 함)
-  if (req.path === "/" || req.path.startsWith("/.well-known/") || req.path.startsWith("/auth/")) {
-    return next();
-  }
-  
-  // initialize는 스펙상 인증 없이 가능할 수 있으나, 보통은 여기서 막아도 됨.
-  // 하지만 Claude가 discovery를 위해 initialize를 먼저 찌를 수 있으므로 일단 통과시키거나 체크.
-  // 여기서는 '토큰이 있으면 통과, 없으면 401' 로직 적용.
-  
+  // 1. [예외] 브라우저 접속(GET /)이나 설정 파일(.well-known)은 봐줍니다.
+  if (req.method === "GET" && req.path === "/") return next(); // GET만 봐줌!
+  if (req.path.startsWith("/.well-known/") || req.path.startsWith("/auth/")) return next();
+  if (req.path === "/favicon.ico") return next();
+
+  // 2. 토큰이 있어서 이메일 확인이 되면 통과!
   const email = extractUserEmail(req);
   if (email) {
-    req.user_email = email; // 추출한 이메일 저장
+    req.user_email = email;
     return next();
   }
 
-  // initialize 메시지 내용 확인
-  if (req.body && req.body.method === "initialize") {
-     // initialize 단계에서도 토큰이 없으면 401을 줘서 로그인을 유도함
-  }
-
-  // [중요] 401 Challenge 응답 생성 (Claude에게 "로그인 해!"라고 알림)
+  // 3. [핵심] 토큰 없는 POST 요청(initialize 등)은 가차 없이 401 에러!
+  // 그래야 Claude가 "아! 로그인해야 하는구나!" 하고 깨닫습니다.
+  console.log(`[Auth] Blocking unauthenticated request: ${req.method} ${req.path}`);
+  
   const metaUrl = `${BASE_URL}/.well-known/oauth-protected-resource`;
-  console.log(`[Auth] 401 Challenge sent. Meta: ${metaUrl}`);
   
   res.status(401)
      .set("WWW-Authenticate", `Bearer resource_metadata="${metaUrl}", scope="openid profile email"`)
