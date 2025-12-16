@@ -199,13 +199,18 @@ const sessions = new Map();
 const handleMcpPost = async (req, res) => {
   const method = req.body?.method;
 
-  // [보안] 이메일 주입
+  // [보안] 이메일 주입 (수정됨)
   if (method === "tools/call" && req.body.params && req.body.params.arguments) {
     if (req.user_email) {
-        console.log(`[Security] Injecting email: ${req.user_email}`);
+        console.log(`[Security] Injecting email to n8n: ${req.user_email}`);
+        
+        // [핵심 수정] n8n이 기다리는 'email' 변수에 강제로 덮어씌웁니다!
+        req.body.params.arguments.email = req.user_email;
+        
+        // (혹시 모르니 기존 user_email도 같이 보내둡니다)
         req.body.params.arguments.user_email = req.user_email;
     } else {
-        console.warn("[Security] No email found in request (Should be blocked by requireAuth)");
+        console.warn("[Security] No email found in request");
     }
   }
 
