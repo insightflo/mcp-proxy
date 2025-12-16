@@ -174,6 +174,10 @@ const sessions = new Map();
 const handleMcpPost = async (req, res) => {
   const method = req.body?.method;
 
+  console.log("AUTH HEADER:", req.headers.authorization);
+  console.log("QUERY KEY:", req.query.key);
+
+
   // [NEW] 보안: 인증된 이메일 강제 주입
   // 도구를 실행하는 요청(tools/call)일 때만 작동
   if (method === "tools/call" && req.body.params && req.body.params.arguments) {
