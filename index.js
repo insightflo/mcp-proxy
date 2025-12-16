@@ -385,11 +385,38 @@ app.post("/auth/token", async (req, res) => {
 
 const AUTH0_METADATA = {
   issuer: `https://${process.env.AUTH0_DOMAIN}/`,
-  authorization_endpoint: `https://${process.env.AUTH0_DOMAIN}/authorize`,
+  // [핵심] Claude가 로그인하러 갈 때, audience를 무조건 들고 가도록 주소 뒤에 파라미터를 붙여버립니다.
+  authorization_endpoint: `https://${process.env.AUTH0_DOMAIN}/authorize?audience=${process.env.AUTH0_AUDIENCE}&scope=openid%20profile%20email%20offline_access`,
   token_endpoint: `https://${process.env.AUTH0_DOMAIN}/oauth/token`,
   registration_endpoint: `https://${process.env.AUTH0_DOMAIN}/oidc/register`,
-  jwks_uri: `https://${process.env.AUTH0_DOMAIN}/.well-known/jwks.json`
+  jwks_uri: `https://${process.env.AUTH0_DOMAIN}/.well-known/jwks.json`,
+  // [추가] 지원하는 스코프 명시
+  scopes_supported: ["openid", "profile", "email", "offline_access"],
+  response_types_supported: ["code"],
+  grant_types_supported: ["authorization_code", "refresh_token"]
 };
+
+// [중요] 토큰이 없으면 401 에러를 뱉어서 Claude에게 "토큰 내놔!"라고 소리치기
+// 기존 app.post("/", handleMcpPost); 등을 아래처럼 감싸야 확실합니다.
+const requireAuth = (req, res, next) => {
+  // 1. 이미 토큰이나 키가 있으면 통과
+  if (extractUserEmail(req)) return next();
+  
+  // 2. 초기화 요청이나 Health Check는 봐줌
+  if (req.method === "GET" && req.path === "/") return next();
+  if (req.body && req.body.method === "initialize") return next();
+
+  // 3. 그 외에는 401 에러 리턴 (Claude가 이걸 보고 토큰을 다시 보낼 수 있음)
+  console.log("[Auth] Blocked unauthenticated request");
+  res.status(401).set('WWW-Authenticate', 'Bearer').json({ error: "Authentication required" });
+};
+
+// 라우트 적용 (handleMcpPost 앞에 requireAuth 추가)
+app.post("/", requireAuth, handleMcpPost);
+app.post("/sse", requireAuth, handleMcpPost);
+// GET /sse는 브라우저 연결 문제로 401을 주면 안 될 수도 있어서 일단 둡니다.
+
+
 app.get("/.well-known/oauth-authorization-server", (req, res) => res.json(AUTH0_METADATA));
 app.get("/.well-known/oauth-protected-resource", (req, res) => res.json({ resource: process.env.AUTH0_AUDIENCE }));
 
