@@ -346,20 +346,43 @@ app.get("/auth/authorize", (req, res) => {
   const auth0Url = `https://${process.env.AUTH0_DOMAIN}/authorize?${params.toString()}`;
   res.redirect(auth0Url);
 });
+
 app.post("/auth/token", async (req, res) => {
+  console.log("=== [OAuth] Token Exchange Requested ==="); // [NEW] 요청 들어옴 확인
   try {
     const { code, redirect_uri } = req.body;
+    console.log(`• Code received: ${code ? "Yes" : "No"}`); // [NEW] 코드 수신 확인
+    
     const response = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        client_id: process.env.AUTH0_CLIENT_ID, client_secret: process.env.AUTH0_CLIENT_SECRET,
-        code: code, grant_type: "authorization_code", redirect_uri: redirect_uri
+        client_id: process.env.AUTH0_CLIENT_ID,
+        client_secret: process.env.AUTH0_CLIENT_SECRET,
+        code: code,
+        grant_type: "authorization_code",
+        redirect_uri: redirect_uri
       })
     });
+    
     const data = await response.json();
+    
+    // [NEW] 결과 확인
+    if (data.access_token) {
+        console.log("✅ [OAuth] Token Issued Successfully!");
+        console.log("• Token Type:", data.token_type);
+        // console.log("• Access Token:", data.access_token); // 보안상 주석 처리
+    } else {
+        console.error("❌ [OAuth] Failed to get token:", JSON.stringify(data));
+    }
+
     res.json(data);
-  } catch (e) { res.status(500).json({ error: "Token exchange failed" }); }
+  } catch (e) {
+    console.error("❌ [OAuth] Exchange Error:", e.message);
+    res.status(500).json({ error: "Token exchange failed" });
+  }
 });
+
 const AUTH0_METADATA = {
   issuer: `https://${process.env.AUTH0_DOMAIN}/`,
   authorization_endpoint: `https://${process.env.AUTH0_DOMAIN}/authorize`,
