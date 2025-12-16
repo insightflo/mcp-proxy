@@ -7,13 +7,19 @@
     "start": "node index.js",
     "dev": "node index.js"
   },
-  "keywords": ["mcp", "claude", "ai", "n8n"],
+  "keywords": [
+    "mcp",
+    "claude",
+    "ai",
+    "n8n"
+  ],
   "author": "dk",
   "license": "MIT",
   "dependencies": {
-    "express": "^4.19.2",
-    "dotenv": "^17.2.3",
     "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.3",
     "undici": "^6.19.2"
   },
   "engines": {
