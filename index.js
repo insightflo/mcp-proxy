@@ -27,22 +27,59 @@ const N8N_MCP_URL = process.env.N8N_MCP_URL;
 const N8N_API_KEY = process.env.N8N_API_KEY || "";
 
 // [NEW] 토큰에서 이메일 추출하는 함수
+// 토큰 탐색 범위 확대
 function extractUserEmail(req) {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      // 토큰이 없는데 API Key로 들어온 경우 (관리자용 백도어)
-      if (req.query.key === process.env.MCP_SECRET_KEY) {
-        return "admin@internal"; // 관리자 이메일 강제 지정
-      }
-      return null;
+    // [디버깅] 들어오는 모든 데이터를 로그에 찍어서 확인 (토큰이 어디 숨었나 찾기 위함)
+    console.log("=== [Auth Debug] Request Info ===");
+    console.log("• Query Params:", JSON.stringify(req.query)); 
+    // 헤더는 너무 기니까 인증 관련만 찍기
+    console.log("• Auth Header:", req.headers.authorization || "없음"); 
+    console.log("=================================");
+
+    let token = null;
+
+    // 1. 헤더에서 토큰 찾기 (Standard)
+    if (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
+      token = req.headers.authorization.split(" ")[1];
+    }
+    // 2. [웹 SSE 대응] URL 쿼리에서 토큰 찾기 (Claude가 이쪽으로 보낼 확률 높음)
+    else if (req.query.access_token) {
+      console.log("[Auth] Found token in query param: access_token");
+      token = req.query.access_token;
+    }
+    else if (req.query.token) {
+       console.log("[Auth] Found token in query param: token");
+       token = req.query.token;
     }
 
-    const token = authHeader.split(" ")[1];
-    const decoded = jwt.decode(token); // 토큰 내용물 확인
+    // 3. 토큰이 발견되었다면 -> 해독해서 이메일 추출
+    if (token) {
+      const decoded = jwt.decode(token);
+      if (!decoded) {
+        console.error("[Auth] Token found but decode failed (Invalid Token)");
+        return null;
+      }
+      
+      // 로그에 토큰 내용 살짝 공개 (이메일 확인용)
+      // console.log("[Auth] Decoded Token Payload:", JSON.stringify(decoded));
 
-    // Auth0 Action에서 넣은 커스텀 클레임 이름
-    return decoded["https://mcp-proxy/email"] || decoded.email || decoded.sub;
+      // 이메일 추출
+      const email = decoded["https://mcp-proxy/email"] || decoded.email || decoded.sub;
+      return email;
+    }
+
+    // 4. 토큰이 없다면 -> API Key 확인 (백도어/데스크탑용)
+    const apiKey = req.query.key;
+    const directEmail = req.query.user_email;
+    const MY_SECRET_KEY = process.env.MCP_SECRET_KEY;
+
+    if (MY_SECRET_KEY && apiKey === MY_SECRET_KEY) {
+      if (directEmail) return directEmail;
+      return "admin@internal"; 
+    }
+
+    return null;
   } catch (e) {
     console.error("Token decode failed:", e.message);
     return null;
