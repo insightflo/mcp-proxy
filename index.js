@@ -62,9 +62,16 @@ app.get("/auth/authorize", (req, res) => {
   // 클라이언트가 보내준 쿼리를 그대로 Auth0로 토스
   const params = new URLSearchParams(req.query);
   
-  // 만약 클라이언트가 audience를 안 보냈다면 강제로 추가 (선택사항)
+  // 만약 클라이언트가 audience를 안 보냈다면 강제로 추가
   if (!params.has("audience") && process.env.AUTH0_AUDIENCE) {
-    params.append("audience", process.env.AUTH0_AUDIENCE);
+    let audience = process.env.AUTH0_AUDIENCE;
+    
+    // [핵심] Railway가 슬래시를 지웠다면, 코드에서 강제로 다시 붙입니다! (auth0의 api 주소가 https://mcp-proxy-production-48c3.up.railway.app/ 으로 되어 있음. )
+    if (!audience.endsWith("/")) {
+      audience = audience + "/";
+    }
+    
+    params.append("audience", audience);
   }
   
   res.redirect(`https://${AUTH0_DOMAIN}/authorize?${params.toString()}`);
