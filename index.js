@@ -250,6 +250,32 @@ const handleSseConnection = (req, res) => {
 // 라우트 등록
 app.get("/", (req, res) => res.send("MCP Server Running")); // 루트는 401 안 걸리게 단순 메시지
 
+// [추가됨] GPT 전용 변환 라우트 (Schema와 코드의 차이를 메꿔줍니다)
+app.post("/gpt/execute", requireAuth, async (req, res) => {
+  const { toolName, arguments: args } = req.body;
+
+  if (!toolName) {
+    return res.status(400).json({ error: "Missing toolName" });
+  }
+
+  // GPT가 보낸 단순 JSON을 -> MCP 표준 JSON-RPC 포맷으로 변환
+  const mcpPayload = {
+    jsonrpc: "2.0",
+    id: `gpt-${crypto.randomUUID()}`, // ID 자동 생성
+    method: "tools/call",
+    params: {
+      name: toolName,
+      arguments: args || {}
+    }
+  };
+
+  // 변환된 데이터를 바디에 덮어씌우고, 기존 MCP 핸들러를 재사용
+  req.body = mcpPayload;
+  
+  // handleMcpPost 호출
+  return handleMcpPost(req, res);
+});
+
 // [중요] SSE 연결은 브라우저 스펙상 헤더를 못 넣을 수 있으므로 requireAuth 제외 고려
 // 하지만 Claude가 GET /sse 시에도 401을 받고 재시도할 수 있으므로 일단 적용해봄.
 // 만약 무한 401이 뜬다면 SSE만 requireAuth 뺄 것.
