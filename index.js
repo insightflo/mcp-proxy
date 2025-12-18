@@ -283,6 +283,67 @@ app.post("/gpt/execute", requireAuth, async (req, res) => {
   return handleMcpPost(req, res);
 });
 
+// [추가] 개인정보 처리방침 (Privacy Policy) 페이지
+app.get("/privacy", (req, res) => {
+  const html = `
+    <html>
+      <head>
+        <title>Privacy Policy - Stock Analysis GPT</title>
+        <style>
+          body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; }
+          h1, h2 { color: #333; }
+          .section { margin-bottom: 20px; }
+        </style>
+      </head>
+      <body>
+        <h1>Privacy Policy</h1>
+        <p><strong>Last Updated:</strong> December 2025</p>
+        
+        <div class="section">
+          <h2>1. Introduction</h2>
+          <p>This Privacy Policy explains how "Stock Analysis MCP" (the "Service") handles your data. The Service is designed to provide stock market analysis using OpenAI's ChatGPT.</p>
+        </div>
+
+        <div class="section">
+          <h2>2. Data Collection</h2>
+          <p>We collect the minimum amount of data required to operate the Service:</p>
+          <ul>
+            <li><strong>Email Address:</strong> Collected via Auth0 for authentication purposes only.</li>
+            <li><strong>Query Data:</strong> The stock tickers or questions you ask are processed to generate answers.</li>
+          </ul>
+        </div>
+
+        <div class="section">
+          <h2>3. Data Usage</h2>
+          <p>Your data is used solely for:</p>
+          <ul>
+            <li>Verifying your identity to prevent abuse.</li>
+            <li>Sending requests to our internal tools (n8n) to fetch financial data.</li>
+          </ul>
+          <p>We do <strong>not</strong> sell or share your personal data with advertisers.</p>
+        </div>
+
+        <div class="section">
+          <h2>4. Third-Party Services</h2>
+          <p>We use the following trusted third-party services:</p>
+          <ul>
+            <li><strong>Auth0:</strong> For secure user authentication.</li>
+            <li><strong>Railway:</strong> For hosting the server infrastructure.</li>
+            <li><strong>OpenAI:</strong> As the interface for the conversation.</li>
+          </ul>
+        </div>
+
+        <div class="section">
+          <h2>5. Contact</h2>
+          <p>If you have questions about this policy, please contact: <br>
+          <a href="mailto:teo@insightflo.co">teo@insightflo.co</a></p>
+        </div>
+      </body>
+    </html>
+  `;
+  res.send(html);
+});
+
 // [중요] SSE 연결은 브라우저 스펙상 헤더를 못 넣을 수 있으므로 requireAuth 제외 고려
 // 하지만 Claude가 GET /sse 시에도 401을 받고 재시도할 수 있으므로 일단 적용해봄.
 // 만약 무한 401이 뜬다면 SSE만 requireAuth 뺄 것.
