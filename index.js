@@ -257,18 +257,21 @@ const handleSseConnection = (req, res) => {
 // 라우트 등록
 app.get("/", (req, res) => res.send("MCP Server Running")); // 루트는 401 안 걸리게 단순 메시지
 
-// [추가됨] GPT 전용 변환 라우트 (Schema와 코드의 차이를 메꿔줍니다)
+// [GPT] 상세 로그가 포함된 GPT 변환 라우트
 app.post("/gpt/execute", requireAuth, async (req, res) => {
+  console.log("👉 [GPT] Request Body:", JSON.stringify(req.body, null, 2)); // GPT가 뭘 보냈는지 확인
+
   const { toolName, arguments: args } = req.body;
 
   if (!toolName) {
+    console.error("❌ [GPT] Error: Missing toolName");
     return res.status(400).json({ error: "Missing toolName" });
   }
 
-  // GPT가 보낸 단순 JSON을 -> MCP 표준 JSON-RPC 포맷으로 변환
+  // 변환
   const mcpPayload = {
     jsonrpc: "2.0",
-    id: `gpt-${crypto.randomUUID()}`, // ID 자동 생성
+    id: `gpt-${crypto.randomUUID()}`,
     method: "tools/call",
     params: {
       name: toolName,
@@ -276,14 +279,24 @@ app.post("/gpt/execute", requireAuth, async (req, res) => {
     }
   };
 
-  // 변환된 데이터를 바디에 덮어씌우고, 기존 MCP 핸들러를 재사용
+  console.log("👉 [GPT] Converted Payload:", JSON.stringify(mcpPayload, null, 2));
+
+  // req.body 교체
   req.body = mcpPayload;
-  
-  // handleMcpPost 호출
-  return handleMcpPost(req, res);
+
+  // handleMcpPost 호출 전, 에러가 나면 잡아서 로그를 찍음
+  try {
+    await handleMcpPost(req, res);
+  } catch (error) {
+    console.error("❌ [GPT] Internal Error inside handleMcpPost:", error);
+    // 이미 응답을 보냈는지 확인 후 에러 응답
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message, stack: error.stack });
+    }
+  }
 });
 
-// [추가] 개인정보 처리방침 (Privacy Policy) 페이지
+// [GPT] 개인정보 처리방침 (Privacy Policy) 페이지
 app.get("/privacy", (req, res) => {
   const html = `
     <html>
