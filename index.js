@@ -309,18 +309,25 @@ class QuickMcpClient {
   async executeTool(toolName, args) {
       const requestId = crypto.randomUUID();
 
+      // [최후의 수단] 하이브리드 페이로드 (Hybrid Payload)
+      // n8n의 버그를 우회하기 위해 '표준 포맷'과 '평탄화 포맷'을 동시에 보냅니다.
       const payload = {
           jsonrpc: "2.0",
           method: "tools/call",
           params: { 
               name: toolName,
-              arguments: args // Flatten 하지 않고 arguments 안에 담습니다.
+              
+              // 1. Validator(검증기) 통과용: "arguments" 봉투 제출
+              arguments: args,
+              
+              // 2. Executor(실행기) 주입용: 내용물을 바닥에 펼쳐 놓음 (Flatten)
+              ...args 
           },
           id: requestId
       };
 
       // [디버깅] n8n으로 보내는 실제 데이터 로그 출력
-      console.log(`👉 [QuickMcp] Flattened Payload:`, JSON.stringify(payload.params, null, 2));
+      console.log(`👉 [QuickMcp] Hybrid Payload:`, JSON.stringify(payload.params, null, 2));));
 
       // 응답 대기 Promise 등록
       const responsePromise = new Promise((resolve, reject) => {
@@ -330,7 +337,7 @@ class QuickMcpClient {
                   this.responseWaiters.delete(requestId);
                   reject(new Error("Timeout waiting for n8n tool execution"));
               }
-          }, 60000); // 툴 실행은 오래 걸릴 수 있으니 60초
+          }, 60000); 
       });
 
       console.log(`[QuickMcp] Sending tool call: ${toolName}`);
