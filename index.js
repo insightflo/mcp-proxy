@@ -9,7 +9,7 @@ if (!isRailway) {
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-const { fetch } = require("undici"); 
+// const { fetch } = require("undici"); 
 const jwt = require("jsonwebtoken");
 
 const app = express();
@@ -30,8 +30,9 @@ const N8N_API_KEY = process.env.N8N_API_KEY || "";
 // [중요] Railway 변수에 BASE_URL을 꼭 설정하세요! (예: https://...railway.app)
 const BASE_URL = process.env.BASE_URL || `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`; 
 
-// ========== 1. 인증/메타데이터 (표준 준수) ==========
-
+// =================================================================
+// 1. 인증/메타데이터
+// =================================================================
 const AUTH0_DOMAIN = process.env.AUTH0_DOMAIN;
 const AUTH0_ISSUER = `https://${AUTH0_DOMAIN}/`;
 
@@ -95,8 +96,9 @@ app.post("/auth/token", async (req, res) => {
   }
 });
 
-// ========== 2. 보안 미들웨어 (401 Challenge) ==========
-
+// =================================================================
+// 2. 보안 미들웨어 (401 Challenge)
+// =================================================================
 // 토큰에서 이메일 추출
 function extractUserEmail(req) {
   try {
@@ -140,10 +142,10 @@ const requireAuth = (req, res, next) => {
      .json({ error: "Authentication required" });
 };
 
-// ========== 3. MCP 로직 (기존과 동일하지만 requireAuth 적용) ==========
-
-// ... (N8nSession 클래스는 기존 코드 그대로 사용하세요. 너무 길어서 생략합니다) ...
-// ... (기존 N8nSession 클래스 코드 붙여넣기) ...
+// =================================================================
+// 3. MCP 로직 (requireAuth 적용)
+// Claude용 지속 연결 클래스 (건드리지 않음)
+// =================================================================.
 class N8nSession {
   constructor(sessionId, res) {
     this.sessionId = sessionId;
@@ -201,8 +203,143 @@ class N8nSession {
 }
 const sessions = new Map();
 
-// ========== 4. 핸들러 및 라우트 ==========
+// =================================================================
+// 4. [신규] GPT 전용 Quick Client (분리됨)
+// =================================================================
+class QuickMcpClient {
+  constructor() {
+    this.controller = new AbortController();
+    this.sessionUrl = null;
+    this.responseWaiters = new Map();
+    this.endpointResolved = null; // 엔드포인트 수신 대기용 Promise
+  }
 
+  // 연결 및 초기화 (반드시 완료될 때까지 대기)
+  async connectAndInit() {
+    console.log("[QuickMcp] Connecting to n8n...");
+    
+    // 1. 엔드포인트를 기다리는 Promise 생성
+    this.endpointPromise = new Promise((resolve, reject) => {
+        this.endpointResolver = resolve;
+        // 10초 내에 엔드포인트 못 받으면 타임아웃
+        setTimeout(() => reject(new Error("Timeout: Failed to receive session URL from n8n")), 10000);
+    });
+
+    // 2. SSE 연결 시작
+    const response = await fetch(N8N_MCP_URL, {
+        method: "GET",
+        headers: { 
+            "Accept": "text/event-stream", 
+            "Cache-Control": "no-cache", 
+            ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) 
+        },
+        signal: this.controller.signal,
+    });
+
+    if (!response.ok) throw new Error(`n8n connection failed: ${response.status}`);
+
+    // 3. 스트림 읽기 시작 (백그라운드)
+    this.readStream(response.body).catch(console.error);
+
+    // 4. 엔드포인트가 잡힐 때까지 여기서 멈춰서 기다림! (핵심)
+    await this.endpointPromise;
+    console.log("[QuickMcp] Connection Ready:", this.sessionUrl);
+  }
+
+  async readStream(body) {
+    const decoder = new TextDecoder();
+    let expectingEndpoint = false;
+
+    // Node.js Stream Iterator
+    for await (const chunk of body) {
+        const text = decoder.decode(chunk, { stream: true });
+        const lines = text.split("\n");
+        
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+
+            if (trimmed.startsWith("event: endpoint")) {
+                expectingEndpoint = true;
+            } else if (expectingEndpoint && trimmed.startsWith("data: ")) {
+                // [중요] 세션 URL 획득
+                const relativePath = trimmed.replace("data: ", "").trim();
+                this.sessionUrl = new URL(relativePath, N8N_MCP_URL).toString();
+                expectingEndpoint = false;
+                
+                // 대기하던 connectAndInit을 풀어줌
+                if (this.endpointResolver) this.endpointResolver(this.sessionUrl);
+                
+                // 즉시 초기화 핸드셰이크 전송
+                this.sendInternal({ 
+                    jsonrpc: "2.0", id: crypto.randomUUID(), method: "initialize", 
+                    params: { protocolVersion: "2024-11-05", clientInfo: { name: "GPT-Quick", version: "1.0" }, capabilities: {} } 
+                });
+
+            } else if (trimmed.startsWith("data: ")) {
+                const jsonStr = trimmed.replace("data: ", "").trim();
+                if (jsonStr && jsonStr !== "[DONE]") {
+                    try {
+                        const msg = JSON.parse(jsonStr);
+                        // 응답을 기다리는 녀석이 있으면 전달
+                        if (msg.id && this.responseWaiters.has(msg.id)) {
+                            const resolve = this.responseWaiters.get(msg.id);
+                            resolve(msg);
+                            this.responseWaiters.delete(msg.id);
+                        }
+                    } catch (e) {}
+                }
+            }
+        }
+    }
+  }
+
+  async sendInternal(payload) {
+      if (!this.sessionUrl) return;
+      await fetch(this.sessionUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
+          body: JSON.stringify(payload)
+      });
+  }
+
+  async executeTool(toolName, args) {
+      const requestId = crypto.randomUUID();
+      const payload = {
+          jsonrpc: "2.0",
+          method: "tools/call",
+          params: { name: toolName, arguments: args },
+          id: requestId
+      };
+
+      // 응답 대기 Promise 등록
+      const responsePromise = new Promise((resolve, reject) => {
+          this.responseWaiters.set(requestId, resolve);
+          setTimeout(() => {
+              if (this.responseWaiters.has(requestId)) {
+                  this.responseWaiters.delete(requestId);
+                  reject(new Error("Timeout waiting for n8n tool execution"));
+              }
+          }, 60000); // 툴 실행은 오래 걸릴 수 있으니 60초
+      });
+
+      console.log(`[QuickMcp] Sending tool call: ${toolName}`);
+      await this.sendInternal(payload);
+      
+      return responsePromise;
+  }
+
+  close() {
+      this.controller.abort();
+      this.responseWaiters.clear();
+  }
+}
+
+
+// =================================================================
+// 5. 핸들러 및 라우트
+// =================================================================
+// Claude용 핸들러 (N8nSession 사용)
 const handleMcpPost = async (req, res) => {
   const method = req.body?.method;
 
@@ -211,7 +348,7 @@ const handleMcpPost = async (req, res) => {
     if (req.user_email) {
         console.log(`[Security] Injecting email to n8n: ${req.user_email}`);
         
-        // [핵심 수정] n8n이 기다리는 'email' 변수에 강제로 덮어씌웁니다!
+        // n8n이 기다리는 'email' 변수에 강제로 덮어씌웁니다!
         req.body.params.arguments.email = req.user_email;
         
         // (혹시 모르니 기존 user_email도 같이 보내둡니다)
@@ -243,6 +380,7 @@ const handleMcpPost = async (req, res) => {
   res.status(200).send("OK");
 };
 
+// Claude용 SSE 핸들러
 const handleSseConnection = (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
   const sessionId = crypto.randomUUID();
@@ -257,19 +395,16 @@ const handleSseConnection = (req, res) => {
 // 라우트 등록
 app.get("/", (req, res) => res.send("MCP Server Running")); // 루트는 401 안 걸리게 단순 메시지
 
-// [GPT] GPT 전용 라우트 (기존 fetch 방식 -> N8nSession 클래스 사용으로 변경)
+// ---------------------------------------------------------------------
+// [수정] GPT 라우트 (QuickMcpClient 사용)
+// ---------------------------------------------------------------------
 app.post('/gpt/execute', async (req, res) => {
-  let session = null;
+  let client = null;
   try {
-    console.log("👉 [GPT] Raw Body:", JSON.stringify(req.body, null, 2));
-
+    console.log("👉 [GPT] Start Request");
     const { toolName, arguments: nestedArgs, ...restBody } = req.body;
+    if (!toolName) return res.status(400).json({ error: "toolName is required" });
 
-    if (!toolName) {
-      return res.status(400).json({ error: "toolName is required" });
-    }
-
-    // 1. 인자 추출 로직 (Nested Arguments 지원)
     let finalArguments = {};
     if (nestedArgs && typeof nestedArgs === 'object' && Object.keys(nestedArgs).length > 0) {
       finalArguments = nestedArgs;
@@ -277,52 +412,28 @@ app.post('/gpt/execute', async (req, res) => {
       finalArguments = restBody;
     }
 
-    console.log(`👉 [GPT] Processing - Tool: ${toolName}`);
-    console.log(`👉 [GPT] Final Arguments to MCP:`, JSON.stringify(finalArguments, null, 2));
+    // 1. 새 클라이언트 생성 및 연결 대기 (여기서 멈춰서 확실히 붙을 때까지 기다림)
+    client = new QuickMcpClient();
+    await client.connectAndInit(); 
 
-    // 2. N8nSession을 사용하여 n8n 연결 시작 (Bearer 인증 + SSE 연결 자동 처리)
-    // GPT 요청은 일회성이므로 res(스트림)는 null로 전달
-    session = new N8nSession(`gpt-${Date.now()}`, null);
-
-    // 3. MCP Tool Call Payload 생성
-    const requestId = crypto.randomUUID();
-    const mcpPayload = {
-      jsonrpc: "2.0",
-      method: "tools/call",
-      params: {
-        name: toolName,
-        arguments: finalArguments
-      },
-      id: requestId
-    };
-
-    // 4. n8n으로 전송 후 결과 대기 (sendToN8nAndWait가 응답을 기다려줌)
-    // 참고: session 생성자에서 connect()가 호출되지만, 세션 URL이 준비될 때까지 sendToN8n 내부에서 잠시 대기합니다.
-    console.log("👉 [Proxy] Sending to n8n via Session and waiting...");
-    const n8nResponse = await session.sendToN8nAndWait(mcpPayload);
-
-    console.log("👉 [Proxy] Response received from n8n.");
-
-    // 5. 에러 체크 및 응답
-    if (n8nResponse.error) {
-        throw new Error(n8nResponse.error.message || "Unknown MCP Error");
-    }
-
-    res.json(n8nResponse);
+    // 2. 툴 실행 및 결과 대기
+    console.log(`👉 [GPT] Executing Tool: ${toolName}`);
+    const result = await client.executeTool(toolName, finalArguments);
+    
+    // 3. 결과 반환
+    console.log("👉 [GPT] Success");
+    res.json(result);
 
   } catch (error) {
-    console.error("❌ GPT Execution Error:", error);
-    res.status(500).json({ 
-        error: error.message,
-        details: "See logs for details" 
-    });
+    console.error("❌ GPT Error:", error);
+    res.status(500).json({ error: error.message });
   } finally {
-    // 6. 사용이 끝난 세션 정리 (연결 종료)
-    if (session) {
-        session.close();
-    }
+    if (client) client.close(); // 연결 종료
   }
 });
+// ---------------------------------------------------------------------
+
+
 // [GPT] 개인정보 처리방침 (Privacy Policy) 페이지
 app.get("/privacy", (req, res) => {
   const html = `
@@ -401,4 +512,5 @@ app.post("/session/:sessionId", requireAuth, async (req, res) => {
 const port = process.env.PORT || 3000;
 app.listen(port, "0.0.0.0", () => {
   console.log(`✅ Strict Auth Server running on port ${port}`);
+  if(!N8N_MCP_URL) console.warn("⚠️ N8N_MCP_URL MISSING");
 });
