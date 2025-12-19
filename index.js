@@ -9,7 +9,7 @@ if (!isRailway) {
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-const { fetch } = require("undici");
+const { fetch } = require("undici"); 
 const jwt = require("jsonwebtoken");
 
 const app = express();
@@ -257,8 +257,9 @@ const handleSseConnection = (req, res) => {
 // 라우트 등록
 app.get("/", (req, res) => res.send("MCP Server Running")); // 루트는 401 안 걸리게 단순 메시지
 
-// [GPT] 상세 로그가 포함된 GPT 변환 라우트
+// [GPT] GPT 전용 라우트 (기존 fetch 방식 -> N8nSession 클래스 사용으로 변경)
 app.post('/gpt/execute', async (req, res) => {
+  let session = null;
   try {
     console.log("👉 [GPT] Raw Body:", JSON.stringify(req.body, null, 2));
 
@@ -268,13 +269,10 @@ app.post('/gpt/execute', async (req, res) => {
       return res.status(400).json({ error: "toolName is required" });
     }
 
-    // [중요] 인자 추출 로직 개선
-    // 1. GPT가 "arguments"라는 키 안에 담아 보냈으면 -> 그 안의 내용물(nestedArgs)을 사용
-    // 2. GPT가 그냥 평평하게 보냈으면 -> 나머지 바디(restBody)를 사용
+    // 1. 인자 추출 로직 (Nested Arguments 지원)
     let finalArguments = {};
-
     if (nestedArgs && typeof nestedArgs === 'object' && Object.keys(nestedArgs).length > 0) {
-      finalArguments = nestedArgs; // 껍질 벗기기 성공
+      finalArguments = nestedArgs;
     } else {
       finalArguments = restBody;
     }
@@ -282,51 +280,47 @@ app.post('/gpt/execute', async (req, res) => {
     console.log(`👉 [GPT] Processing - Tool: ${toolName}`);
     console.log(`👉 [GPT] Final Arguments to MCP:`, JSON.stringify(finalArguments, null, 2));
 
-    // MCP 서버로 요청 전송
+    // 2. N8nSession을 사용하여 n8n 연결 시작 (Bearer 인증 + SSE 연결 자동 처리)
+    // GPT 요청은 일회성이므로 res(스트림)는 null로 전달
+    session = new N8nSession(`gpt-${Date.now()}`, null);
+
+    // 3. MCP Tool Call Payload 생성
+    const requestId = crypto.randomUUID();
     const mcpPayload = {
       jsonrpc: "2.0",
       method: "tools/call",
       params: {
         name: toolName,
-        arguments: finalArguments // 이제 { country: "US", ... } 형태로 깔끔하게 들어갑니다.
+        arguments: finalArguments
       },
-      id: `gpt-${Date.now()}`
+      id: requestId
     };
 
-    const response = await fetch(`${process.env.N8N_MCP_URL || 'http://localhost:3000'}/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(mcpPayload)
-    });
+    // 4. n8n으로 전송 후 결과 대기 (sendToN8nAndWait가 응답을 기다려줌)
+    // 참고: session 생성자에서 connect()가 호출되지만, 세션 URL이 준비될 때까지 sendToN8n 내부에서 잠시 대기합니다.
+    console.log("👉 [Proxy] Sending to n8n via Session and waiting...");
+    const n8nResponse = await session.sendToN8nAndWait(mcpPayload);
 
-    // ⚠️ 수정: 무조건 JSON으로 변환하지 말고, 텍스트를 먼저 확인합니다.
-    const rawText = await response.text();
+    console.log("👉 [Proxy] Response received from n8n.");
 
-    console.log("👉 [n8n Response Raw]:", rawText); // <--- 여기에 정답이 나옵니다!
-
-    let data;
-    try {
-        data = JSON.parse(rawText);
-    } catch (e) {
-        console.error("❌ n8n 응답이 JSON이 아닙니다:", rawText);
-        return res.status(502).json({ 
-            error: "Invalid response from n8n", 
-            details: rawText 
-        });
-    }
-    
-    // MCP 에러 처리
-    if (data.error) {
-        console.error("❌ MCP Error:", data.error);
-        return res.status(500).json({ error: data.error });
+    // 5. 에러 체크 및 응답
+    if (n8nResponse.error) {
+        throw new Error(n8nResponse.error.message || "Unknown MCP Error");
     }
 
-    // 성공 응답
-    res.json(data);
+    res.json(n8nResponse);
 
   } catch (error) {
-    console.error("❌ Server Error:", error);
-    res.status(500).json({ error: error.message });
+    console.error("❌ GPT Execution Error:", error);
+    res.status(500).json({ 
+        error: error.message,
+        details: "See logs for details" 
+    });
+  } finally {
+    // 6. 사용이 끝난 세션 정리 (연결 종료)
+    if (session) {
+        session.close();
+    }
   }
 });
 // [GPT] 개인정보 처리방침 (Privacy Policy) 페이지
