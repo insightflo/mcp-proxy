@@ -309,21 +309,12 @@ class QuickMcpClient {
   async executeTool(toolName, args) {
       const requestId = crypto.randomUUID();
 
-      // const payload = {
-      //     jsonrpc: "2.0",
-      //     method: "tools/call",
-      //     params: { name: toolName, arguments: args },
-      //     id: requestId
-      // };
-
-      // [수정] MCP 표준(arguments) 대신, n8n 호환성을 위해 인자를 평탄화(Flatten)하여 전송
       const payload = {
           jsonrpc: "2.0",
           method: "tools/call",
           params: { 
               name: toolName,
-              // arguments: args,  <-- [삭제] 이게 표준이지만 n8n이 에러를 냄
-              ...args             // <-- [추가] 인자를 params 바로 아래에 펼쳐서 넣음
+              arguments: args // Flatten 하지 않고 arguments 안에 담습니다.
           },
           id: requestId
       };
