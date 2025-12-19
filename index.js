@@ -211,37 +211,25 @@ class QuickMcpClient {
     this.controller = new AbortController();
     this.sessionUrl = null;
     this.responseWaiters = new Map();
-    this.endpointResolved = null; // 엔드포인트 수신 대기용 Promise
+    this.endpointResolved = null; 
   }
 
-  // 연결 및 초기화 (반드시 완료될 때까지 대기)
   async connectAndInit() {
     console.log("[QuickMcp] Connecting to n8n...");
-    
-    // 1. 엔드포인트를 기다리는 Promise 생성
     this.endpointPromise = new Promise((resolve, reject) => {
         this.endpointResolver = resolve;
-        // 10초 내에 엔드포인트 못 받으면 타임아웃
         setTimeout(() => reject(new Error("Timeout: Failed to receive session URL from n8n")), 10000);
     });
 
-    // 2. SSE 연결 시작
     const response = await fetch(N8N_MCP_URL, {
         method: "GET",
-        headers: { 
-            "Accept": "text/event-stream", 
-            "Cache-Control": "no-cache", 
-            ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) 
-        },
+        headers: { "Accept": "text/event-stream", "Cache-Control": "no-cache", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
         signal: this.controller.signal,
     });
-
     if (!response.ok) throw new Error(`n8n connection failed: ${response.status}`);
-
-    // 3. 스트림 읽기 시작 (백그라운드)
-    this.readStream(response.body).catch(console.error);
-
-    // 4. 엔드포인트가 잡힐 때까지 여기서 멈춰서 기다림! (핵심)
+    this.readStream(response.body).catch(e => {
+        if(e.name !== 'AbortError') console.error("Stream Error:", e);
+    });
     await this.endpointPromise;
     console.log("[QuickMcp] Connection Ready:", this.sessionUrl);
   }
@@ -249,52 +237,29 @@ class QuickMcpClient {
   async readStream(body) {
     const decoder = new TextDecoder();
     let expectingEndpoint = false;
-
-    try { // [수정] try-catch 블록 추가
-        // Node.js Stream Iterator
+    try {
         for await (const chunk of body) {
             const text = decoder.decode(chunk, { stream: true });
             const lines = text.split("\n");
-            
             for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed) continue;
-
-                if (trimmed.startsWith("event: endpoint")) {
-                    expectingEndpoint = true;
-                } else if (expectingEndpoint && trimmed.startsWith("data: ")) {
+                if (trimmed.startsWith("event: endpoint")) { expectingEndpoint = true; } 
+                else if (expectingEndpoint && trimmed.startsWith("data: ")) {
                     const relativePath = trimmed.replace("data: ", "").trim();
                     this.sessionUrl = new URL(relativePath, N8N_MCP_URL).toString();
                     expectingEndpoint = false;
-                    
                     if (this.endpointResolver) this.endpointResolver(this.sessionUrl);
-                    
-                    this.sendInternal({ 
-                        jsonrpc: "2.0", id: crypto.randomUUID(), method: "initialize", 
-                        params: { protocolVersion: "2024-11-05", clientInfo: { name: "GPT-Quick", version: "1.0" }, capabilities: {} } 
-                    });
-
+                    this.sendInternal({ jsonrpc: "2.0", id: crypto.randomUUID(), method: "initialize", params: { protocolVersion: "2024-11-05", clientInfo: { name: "GPT-Quick", version: "1.0" }, capabilities: {} } });
                 } else if (trimmed.startsWith("data: ")) {
                     const jsonStr = trimmed.replace("data: ", "").trim();
                     if (jsonStr && jsonStr !== "[DONE]") {
-                        try {
-                            const msg = JSON.parse(jsonStr);
-                            if (msg.id && this.responseWaiters.has(msg.id)) {
-                                const resolve = this.responseWaiters.get(msg.id);
-                                resolve(msg);
-                                this.responseWaiters.delete(msg.id);
-                            }
-                        } catch (e) {}
+                        try { const msg = JSON.parse(jsonStr); if (msg.id && this.responseWaiters.has(msg.id)) { const resolve = this.responseWaiters.get(msg.id); resolve(msg); this.responseWaiters.delete(msg.id); } } catch (e) {}
                     }
                 }
             }
         }
-    } catch (error) {
-        // [수정] 의도된 종료(Abort)는 에러 로그를 찍지 않음
-        if (error.name !== 'AbortError') {
-            console.error("[QuickMcp] Stream Error:", error);
-        }
-    }
+    } catch (error) { if (error.name !== 'AbortError') console.error("[QuickMcp] Stream Error:", error); }
   }
 
   async sendInternal(payload) {
@@ -308,48 +273,25 @@ class QuickMcpClient {
 
   async executeTool(toolName, args) {
       const requestId = crypto.randomUUID();
-
-      // [최후의 수단] 하이브리드 페이로드 (Hybrid Payload)
-      // n8n의 버그를 우회하기 위해 '표준 포맷'과 '평탄화 포맷'을 동시에 보냅니다.
+      // [표준 방식] n8n이 'arguments' 입력을 받을 수 있도록 표준 포맷 전송
       const payload = {
           jsonrpc: "2.0",
           method: "tools/call",
-          params: { 
-              name: toolName,
-              
-              // 1. Validator(검증기) 통과용: "arguments" 봉투 제출
-              arguments: args,
-              
-              // 2. Executor(실행기) 주입용: 내용물을 바닥에 펼쳐 놓음 (Flatten)
-              ...args 
-          },
+          params: { name: toolName, arguments: args },
           id: requestId
       };
-
-      // [디버깅] n8n으로 보내는 실제 데이터 로그 출력
-      console.log(`👉 [QuickMcp] Hybrid Payload:`, JSON.stringify(payload.params, null, 2));
-
-      // 응답 대기 Promise 등록
+      
+      console.log(`👉 [QuickMcp] Sending Standard Payload:`, JSON.stringify(payload.params));
+      
       const responsePromise = new Promise((resolve, reject) => {
           this.responseWaiters.set(requestId, resolve);
-          setTimeout(() => {
-              if (this.responseWaiters.has(requestId)) {
-                  this.responseWaiters.delete(requestId);
-                  reject(new Error("Timeout waiting for n8n tool execution"));
-              }
-          }, 60000); 
+          setTimeout(() => { if (this.responseWaiters.has(requestId)) { this.responseWaiters.delete(requestId); reject(new Error("Timeout waiting for n8n tool execution")); } }, 60000); 
       });
-
-      console.log(`[QuickMcp] Sending tool call: ${toolName}`);
       await this.sendInternal(payload);
-      
       return responsePromise;
   }
-
-  close() {
-      this.controller.abort();
-      this.responseWaiters.clear();
-  }
+  
+  close() { this.controller.abort(); this.responseWaiters.clear(); }
 }
 
 
@@ -413,69 +355,35 @@ const handleSseConnection = (req, res) => {
 app.get("/", (req, res) => res.send("MCP Server Running")); // 루트는 401 안 걸리게 단순 메시지
 
 // ---------------------------------------------------------------------
-// [수정] GPT 라우트 (QuickMcpClient 사용)
+// [GPT] GPT 라우트 (QuickMcpClient 사용)
 // ---------------------------------------------------------------------
 app.post('/gpt/execute', async (req, res) => {
   let client = null;
   try {
     console.log("👉 [GPT] Start Request");
-    console.log("👉 [GPT] Raw Body:", JSON.stringify(req.body, null, 2)); // 원본 데이터 확인
-
     const { toolName, arguments: nestedArgs, ...restBody } = req.body;
     if (!toolName) return res.status(400).json({ error: "toolName is required" });
 
-    // [중요] 인자 정리 로직 강화
+    // 인자 정리
     let finalArguments = {};
-
-    // 1. arguments 키가 있는 경우
     if (nestedArgs) {
         if (typeof nestedArgs === 'string') {
-            try {
-                finalArguments = JSON.parse(nestedArgs); // 문자열이면 객체로 변환
-            } catch (e) {
-                console.error("Failed to parse arguments string:", nestedArgs);
-                finalArguments = {};
-            }
-        } else if (typeof nestedArgs === 'object') {
-             // 혹시 GPT가 arguments 안에 또 arguments를 넣었는지 확인 (이중 포장 방지)
-             if (nestedArgs.arguments && typeof nestedArgs.arguments === 'object') {
-                 console.log("⚠️ Detected double-wrapped arguments, unwrapping...");
-                 finalArguments = nestedArgs.arguments;
-             } else {
-                 finalArguments = nestedArgs;
-             }
-        }
-    } 
-    // 2. arguments 키가 없고 평평하게 온 경우
-    else if (Object.keys(restBody).length > 0) {
-        finalArguments = restBody;
-    }
+            try { finalArguments = JSON.parse(nestedArgs); } catch (e) { finalArguments = {}; }
+        } else { finalArguments = nestedArgs; }
+    } else if (Object.keys(restBody).length > 0) { finalArguments = restBody; }
 
     console.log(`👉 [GPT] Tool: ${toolName}`);
-    console.log(`👉 [GPT] Extracted Args:`, JSON.stringify(finalArguments, null, 2));
-
-    // 1. 새 클라이언트 생성 및 연결 대기 (여기서 멈춰서 확실히 붙을 때까지 기다림)
+    
     client = new QuickMcpClient();
     await client.connectAndInit(); 
-
-    // 2. 툴 실행 및 결과 대기
-    console.log(`👉 [GPT] Executing Tool: ${toolName}`);
     const result = await client.executeTool(toolName, finalArguments);
     
-    // 3. 결과 반환
-    console.log("👉 [GPT] Success Result:", JSON.stringify(result).substring(0, 100) + "...");
+    console.log("👉 [GPT] Success");
     res.json(result);
-
   } catch (error) {
     console.error("❌ GPT Error:", error);
-    // n8n이 보낸 에러 메시지를 그대로 GPT에게 전달해서 보여주게 함
-    res.status(500).json({ 
-        error: error.message,
-        details: "Check Railway Logs for payload details"
-    });
-  } finally {
-    if (client) client.close(); // 연결 종료
-  }
+    res.status(500).json({ error: error.message });
+  } finally { if (client) client.close(); }
 });
 // ---------------------------------------------------------------------
 
