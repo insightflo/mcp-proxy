@@ -250,46 +250,49 @@ class QuickMcpClient {
     const decoder = new TextDecoder();
     let expectingEndpoint = false;
 
-    // Node.js Stream Iterator
-    for await (const chunk of body) {
-        const text = decoder.decode(chunk, { stream: true });
-        const lines = text.split("\n");
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
+    try { // [수정] try-catch 블록 추가
+        // Node.js Stream Iterator
+        for await (const chunk of body) {
+            const text = decoder.decode(chunk, { stream: true });
+            const lines = text.split("\n");
+            
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
 
-            if (trimmed.startsWith("event: endpoint")) {
-                expectingEndpoint = true;
-            } else if (expectingEndpoint && trimmed.startsWith("data: ")) {
-                // [중요] 세션 URL 획득
-                const relativePath = trimmed.replace("data: ", "").trim();
-                this.sessionUrl = new URL(relativePath, N8N_MCP_URL).toString();
-                expectingEndpoint = false;
-                
-                // 대기하던 connectAndInit을 풀어줌
-                if (this.endpointResolver) this.endpointResolver(this.sessionUrl);
-                
-                // 즉시 초기화 핸드셰이크 전송
-                this.sendInternal({ 
-                    jsonrpc: "2.0", id: crypto.randomUUID(), method: "initialize", 
-                    params: { protocolVersion: "2024-11-05", clientInfo: { name: "GPT-Quick", version: "1.0" }, capabilities: {} } 
-                });
+                if (trimmed.startsWith("event: endpoint")) {
+                    expectingEndpoint = true;
+                } else if (expectingEndpoint && trimmed.startsWith("data: ")) {
+                    const relativePath = trimmed.replace("data: ", "").trim();
+                    this.sessionUrl = new URL(relativePath, N8N_MCP_URL).toString();
+                    expectingEndpoint = false;
+                    
+                    if (this.endpointResolver) this.endpointResolver(this.sessionUrl);
+                    
+                    this.sendInternal({ 
+                        jsonrpc: "2.0", id: crypto.randomUUID(), method: "initialize", 
+                        params: { protocolVersion: "2024-11-05", clientInfo: { name: "GPT-Quick", version: "1.0" }, capabilities: {} } 
+                    });
 
-            } else if (trimmed.startsWith("data: ")) {
-                const jsonStr = trimmed.replace("data: ", "").trim();
-                if (jsonStr && jsonStr !== "[DONE]") {
-                    try {
-                        const msg = JSON.parse(jsonStr);
-                        // 응답을 기다리는 녀석이 있으면 전달
-                        if (msg.id && this.responseWaiters.has(msg.id)) {
-                            const resolve = this.responseWaiters.get(msg.id);
-                            resolve(msg);
-                            this.responseWaiters.delete(msg.id);
-                        }
-                    } catch (e) {}
+                } else if (trimmed.startsWith("data: ")) {
+                    const jsonStr = trimmed.replace("data: ", "").trim();
+                    if (jsonStr && jsonStr !== "[DONE]") {
+                        try {
+                            const msg = JSON.parse(jsonStr);
+                            if (msg.id && this.responseWaiters.has(msg.id)) {
+                                const resolve = this.responseWaiters.get(msg.id);
+                                resolve(msg);
+                                this.responseWaiters.delete(msg.id);
+                            }
+                        } catch (e) {}
+                    }
                 }
             }
+        }
+    } catch (error) {
+        // [수정] 의도된 종료(Abort)는 에러 로그를 찍지 않음
+        if (error.name !== 'AbortError') {
+            console.error("[QuickMcp] Stream Error:", error);
         }
     }
   }
