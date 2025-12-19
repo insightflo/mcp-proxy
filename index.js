@@ -261,22 +261,31 @@ app.get("/", (req, res) => res.send("MCP Server Running")); // 루트는 401 안
 app.post("/gpt/execute", requireAuth, async (req, res) => {
   console.log("👉 [GPT] Request Body:", JSON.stringify(req.body, null, 2)); // GPT가 뭘 보냈는지 확인
 
-  const { toolName, arguments: args } = req.body;
+  // 1. toolName과 나머지 데이터를 분리합니다.
+  const { toolName, arguments: nestedArgs, ...restArgs } = req.body;
 
   if (!toolName) {
     console.error("❌ [GPT] Error: Missing toolName");
     return res.status(400).json({ error: "Missing toolName" });
   }
 
-  // 변환
+  // 2. arguments가 명시적으로 있으면 그걸 쓰고, 없으면 나머지(restArgs)를 인자로 간주합니다.
+  // (GPT가 가끔 arguments 껍데기 없이 파라미터를 바로 보낼 때를 대비함)
+  const finalArguments = (nestedArgs && Object.keys(nestedArgs).length > 0) 
+    ? nestedArgs 
+    : restArgs;
+
+  console.log(`👉 [GPT] Parsed - Tool: ${toolName}, Args:`, finalArguments);
+
+  // 3. MCP 형식으로 변환 (수정된 finalArguments 사용)
   const mcpPayload = {
     jsonrpc: "2.0",
-    id: `gpt-${crypto.randomUUID()}`,
     method: "tools/call",
     params: {
       name: toolName,
-      arguments: args || {}
-    }
+      arguments: finalArguments // 여기에 정확한 인자가 들어가야 합니다.
+    },
+    id: `gpt-${Date.now()}` // ID 생성
   };
 
   console.log("👉 [GPT] Converted Payload:", JSON.stringify(mcpPayload, null, 2));
