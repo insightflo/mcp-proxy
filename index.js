@@ -299,7 +299,21 @@ app.post('/gpt/execute', async (req, res) => {
         body: JSON.stringify(mcpPayload)
     });
 
-    const data = await response.json();
+    // ⚠️ 수정: 무조건 JSON으로 변환하지 말고, 텍스트를 먼저 확인합니다.
+    const rawText = await response.text();
+
+    console.log("👉 [n8n Response Raw]:", rawText); // <--- 여기에 정답이 나옵니다!
+
+    let data;
+    try {
+        data = JSON.parse(rawText);
+    } catch (e) {
+        console.error("❌ n8n 응답이 JSON이 아닙니다:", rawText);
+        return res.status(502).json({ 
+            error: "Invalid response from n8n", 
+            details: rawText 
+        });
+    }
     
     // MCP 에러 처리
     if (data.error) {
