@@ -409,15 +409,40 @@ app.post('/gpt/execute', async (req, res) => {
   let client = null;
   try {
     console.log("👉 [GPT] Start Request");
+    console.log("👉 [GPT] Raw Body:", JSON.stringify(req.body, null, 2)); // 원본 데이터 확인
+
     const { toolName, arguments: nestedArgs, ...restBody } = req.body;
     if (!toolName) return res.status(400).json({ error: "toolName is required" });
 
+    // [중요] 인자 정리 로직 강화
     let finalArguments = {};
-    if (nestedArgs && typeof nestedArgs === 'object' && Object.keys(nestedArgs).length > 0) {
-      finalArguments = nestedArgs;
-    } else {
-      finalArguments = restBody;
+
+    // 1. arguments 키가 있는 경우
+    if (nestedArgs) {
+        if (typeof nestedArgs === 'string') {
+            try {
+                finalArguments = JSON.parse(nestedArgs); // 문자열이면 객체로 변환
+            } catch (e) {
+                console.error("Failed to parse arguments string:", nestedArgs);
+                finalArguments = {};
+            }
+        } else if (typeof nestedArgs === 'object') {
+             // 혹시 GPT가 arguments 안에 또 arguments를 넣었는지 확인 (이중 포장 방지)
+             if (nestedArgs.arguments && typeof nestedArgs.arguments === 'object') {
+                 console.log("⚠️ Detected double-wrapped arguments, unwrapping...");
+                 finalArguments = nestedArgs.arguments;
+             } else {
+                 finalArguments = nestedArgs;
+             }
+        }
+    } 
+    // 2. arguments 키가 없고 평평하게 온 경우
+    else if (Object.keys(restBody).length > 0) {
+        finalArguments = restBody;
     }
+
+    console.log(`👉 [GPT] Tool: ${toolName}`);
+    console.log(`👉 [GPT] Extracted Args:`, JSON.stringify(finalArguments, null, 2));
 
     // 1. 새 클라이언트 생성 및 연결 대기 (여기서 멈춰서 확실히 붙을 때까지 기다림)
     client = new QuickMcpClient();
@@ -428,12 +453,16 @@ app.post('/gpt/execute', async (req, res) => {
     const result = await client.executeTool(toolName, finalArguments);
     
     // 3. 결과 반환
-    console.log("👉 [GPT] Success");
+    console.log("👉 [GPT] Success Result:", JSON.stringify(result).substring(0, 100) + "...");
     res.json(result);
 
   } catch (error) {
     console.error("❌ GPT Error:", error);
-    res.status(500).json({ error: error.message });
+    // n8n이 보낸 에러 메시지를 그대로 GPT에게 전달해서 보여주게 함
+    res.status(500).json({ 
+        error: error.message,
+        details: "Check Railway Logs for payload details"
+    });
   } finally {
     if (client) client.close(); // 연결 종료
   }
