@@ -237,7 +237,7 @@ const handleMcpPost = async (req, res) => {
       if (lastSessionId) { const session = sessions.get(lastSessionId); await session.sendToN8n(req.body); return res.status(202).end(); }
       
       const tempId = `temp-${crypto.randomUUID()}`; const tempSession = new N8nSession(tempId, null);
-      try { await new Promise(r => setTimeout(r, 1000)); const response = await tempSession.sendToN8nAndWait(req.body); return res.json(response); } finally { tempSession.close(); }
+      try { await new Promise(r => setTimeout(r, 5000)); const response = await tempSession.sendToN8nAndWait(req.body); return res.json(response); } finally { tempSession.close(); }
     } catch (e) { return res.status(500).json({ error: e.message }); }
   }
   res.status(200).send("OK");
