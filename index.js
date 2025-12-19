@@ -293,12 +293,7 @@ app.post('/gpt/execute', async (req, res) => {
       id: `gpt-${Date.now()}`
     };
 
-    // (기존의 fetch 로직 유지)
-    // 예: const response = await fetch(MCP_SERVER_URL, { ... });
-    // ... 결과 반환 로직 ...
-
-    // 아래는 작성되어 있으실 fetch 예시입니다 (참고용)
-    const response = await fetch(`${process.env.MCP_SERVER_URL || 'http://localhost:3000'}/`, {
+    const response = await fetch(`${process.env.N8N_MCP_URL || 'http://localhost:3000'}/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(mcpPayload)
