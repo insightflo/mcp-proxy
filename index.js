@@ -258,53 +258,68 @@ const handleSseConnection = (req, res) => {
 app.get("/", (req, res) => res.send("MCP Server Running")); // 루트는 401 안 걸리게 단순 메시지
 
 // [GPT] 상세 로그가 포함된 GPT 변환 라우트
-app.post("/gpt/execute", requireAuth, async (req, res) => {
-  console.log("👉 [GPT] Request Body:", JSON.stringify(req.body, null, 2)); // GPT가 뭘 보냈는지 확인
-
-  // 1. toolName과 나머지 데이터를 분리합니다.
-  const { toolName, arguments: nestedArgs, ...restArgs } = req.body;
-
-  if (!toolName) {
-    console.error("❌ [GPT] Error: Missing toolName");
-    return res.status(400).json({ error: "Missing toolName" });
-  }
-
-  // 2. arguments가 명시적으로 있으면 그걸 쓰고, 없으면 나머지(restArgs)를 인자로 간주합니다.
-  // (GPT가 가끔 arguments 껍데기 없이 파라미터를 바로 보낼 때를 대비함)
-  const finalArguments = (nestedArgs && Object.keys(nestedArgs).length > 0) 
-    ? nestedArgs 
-    : restArgs;
-
-  console.log(`👉 [GPT] Parsed - Tool: ${toolName}, Args:`, finalArguments);
-
-  // 3. MCP 형식으로 변환 (수정된 finalArguments 사용)
-  const mcpPayload = {
-    jsonrpc: "2.0",
-    method: "tools/call",
-    params: {
-      name: toolName,
-      arguments: finalArguments // 여기에 정확한 인자가 들어가야 합니다.
-    },
-    id: `gpt-${Date.now()}` // ID 생성
-  };
-
-  console.log("👉 [GPT] Converted Payload:", JSON.stringify(mcpPayload, null, 2));
-
-  // req.body 교체
-  req.body = mcpPayload;
-
-  // handleMcpPost 호출 전, 에러가 나면 잡아서 로그를 찍음
+app.post('/gpt/execute', async (req, res) => {
   try {
-    await handleMcpPost(req, res);
-  } catch (error) {
-    console.error("❌ [GPT] Internal Error inside handleMcpPost:", error);
-    // 이미 응답을 보냈는지 확인 후 에러 응답
-    if (!res.headersSent) {
-      res.status(500).json({ error: error.message, stack: error.stack });
+    console.log("👉 [GPT] Raw Body:", JSON.stringify(req.body, null, 2));
+
+    const { toolName, arguments: nestedArgs, ...restBody } = req.body;
+
+    if (!toolName) {
+      return res.status(400).json({ error: "toolName is required" });
     }
+
+    // [중요] 인자 추출 로직 개선
+    // 1. GPT가 "arguments"라는 키 안에 담아 보냈으면 -> 그 안의 내용물(nestedArgs)을 사용
+    // 2. GPT가 그냥 평평하게 보냈으면 -> 나머지 바디(restBody)를 사용
+    let finalArguments = {};
+
+    if (nestedArgs && typeof nestedArgs === 'object' && Object.keys(nestedArgs).length > 0) {
+      finalArguments = nestedArgs; // 껍질 벗기기 성공
+    } else {
+      finalArguments = restBody;
+    }
+
+    console.log(`👉 [GPT] Processing - Tool: ${toolName}`);
+    console.log(`👉 [GPT] Final Arguments to MCP:`, JSON.stringify(finalArguments, null, 2));
+
+    // MCP 서버로 요청 전송
+    const mcpPayload = {
+      jsonrpc: "2.0",
+      method: "tools/call",
+      params: {
+        name: toolName,
+        arguments: finalArguments // 이제 { country: "US", ... } 형태로 깔끔하게 들어갑니다.
+      },
+      id: `gpt-${Date.now()}`
+    };
+
+    // (기존의 fetch 로직 유지)
+    // 예: const response = await fetch(MCP_SERVER_URL, { ... });
+    // ... 결과 반환 로직 ...
+
+    // 아래는 작성되어 있으실 fetch 예시입니다 (참고용)
+    const response = await fetch(`${process.env.MCP_SERVER_URL || 'http://localhost:3000'}/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(mcpPayload)
+    });
+
+    const data = await response.json();
+    
+    // MCP 에러 처리
+    if (data.error) {
+        console.error("❌ MCP Error:", data.error);
+        return res.status(500).json({ error: data.error });
+    }
+
+    // 성공 응답
+    res.json(data);
+
+  } catch (error) {
+    console.error("❌ Server Error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
-
 // [GPT] 개인정보 처리방침 (Privacy Policy) 페이지
 app.get("/privacy", (req, res) => {
   const html = `
