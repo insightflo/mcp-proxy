@@ -327,7 +327,7 @@ class QuickMcpClient {
       };
 
       // [디버깅] n8n으로 보내는 실제 데이터 로그 출력
-      console.log(`👉 [QuickMcp] Hybrid Payload:`, JSON.stringify(payload.params, null, 2));));
+      console.log(`👉 [QuickMcp] Hybrid Payload:`, JSON.stringify(payload.params, null, 2));
 
       // 응답 대기 Promise 등록
       const responsePromise = new Promise((resolve, reject) => {
