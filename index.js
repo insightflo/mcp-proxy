@@ -9,7 +9,7 @@ if (!isRailway) {
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-// const { fetch } = require("undici"); 
+const { fetch } = require("undici");
 const jwt = require("jsonwebtoken");
 
 const app = express();
@@ -204,101 +204,8 @@ class N8nSession {
 const sessions = new Map();
 
 // =================================================================
-// 4. [신규] GPT 전용 Quick Client (분리됨)
+// 4. 핸들러 및 라우트
 // =================================================================
-class QuickMcpClient {
-  constructor() {
-    this.controller = new AbortController();
-    this.sessionUrl = null;
-    this.responseWaiters = new Map();
-    this.endpointResolved = null; 
-  }
-
-  async connectAndInit() {
-    console.log("[QuickMcp] Connecting to n8n...");
-    this.endpointPromise = new Promise((resolve, reject) => {
-        this.endpointResolver = resolve;
-        setTimeout(() => reject(new Error("Timeout: Failed to receive session URL from n8n")), 10000);
-    });
-
-    const response = await fetch(N8N_MCP_URL, {
-        method: "GET",
-        headers: { "Accept": "text/event-stream", "Cache-Control": "no-cache", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
-        signal: this.controller.signal,
-    });
-    if (!response.ok) throw new Error(`n8n connection failed: ${response.status}`);
-    this.readStream(response.body).catch(e => {
-        if(e.name !== 'AbortError') console.error("Stream Error:", e);
-    });
-    await this.endpointPromise;
-    console.log("[QuickMcp] Connection Ready:", this.sessionUrl);
-  }
-
-  async readStream(body) {
-    const decoder = new TextDecoder();
-    let expectingEndpoint = false;
-    try {
-        for await (const chunk of body) {
-            const text = decoder.decode(chunk, { stream: true });
-            const lines = text.split("\n");
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-                if (trimmed.startsWith("event: endpoint")) { expectingEndpoint = true; } 
-                else if (expectingEndpoint && trimmed.startsWith("data: ")) {
-                    const relativePath = trimmed.replace("data: ", "").trim();
-                    this.sessionUrl = new URL(relativePath, N8N_MCP_URL).toString();
-                    expectingEndpoint = false;
-                    if (this.endpointResolver) this.endpointResolver(this.sessionUrl);
-                    this.sendInternal({ jsonrpc: "2.0", id: crypto.randomUUID(), method: "initialize", params: { protocolVersion: "2024-11-05", clientInfo: { name: "GPT-Quick", version: "1.0" }, capabilities: {} } });
-                } else if (trimmed.startsWith("data: ")) {
-                    const jsonStr = trimmed.replace("data: ", "").trim();
-                    if (jsonStr && jsonStr !== "[DONE]") {
-                        try { const msg = JSON.parse(jsonStr); if (msg.id && this.responseWaiters.has(msg.id)) { const resolve = this.responseWaiters.get(msg.id); resolve(msg); this.responseWaiters.delete(msg.id); } } catch (e) {}
-                    }
-                }
-            }
-        }
-    } catch (error) { if (error.name !== 'AbortError') console.error("[QuickMcp] Stream Error:", error); }
-  }
-
-  async sendInternal(payload) {
-      if (!this.sessionUrl) return;
-      await fetch(this.sessionUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", ...(N8N_API_KEY ? { "Authorization": `Bearer ${N8N_API_KEY}` } : {}) },
-          body: JSON.stringify(payload)
-      });
-  }
-
-  async executeTool(toolName, args) {
-      const requestId = crypto.randomUUID();
-      // [표준 방식] n8n이 'arguments' 입력을 받을 수 있도록 표준 포맷 전송
-      const payload = {
-          jsonrpc: "2.0",
-          method: "tools/call",
-          params: { name: toolName, arguments: args },
-          id: requestId
-      };
-      
-      console.log(`👉 [QuickMcp] Sending Standard Payload:`, JSON.stringify(payload.params));
-      
-      const responsePromise = new Promise((resolve, reject) => {
-          this.responseWaiters.set(requestId, resolve);
-          setTimeout(() => { if (this.responseWaiters.has(requestId)) { this.responseWaiters.delete(requestId); reject(new Error("Timeout waiting for n8n tool execution")); } }, 60000); 
-      });
-      await this.sendInternal(payload);
-      return responsePromise;
-  }
-  
-  close() { this.controller.abort(); this.responseWaiters.clear(); }
-}
-
-
-// =================================================================
-// 5. 핸들러 및 라우트
-// =================================================================
-// Claude용 핸들러 (N8nSession 사용)
 const handleMcpPost = async (req, res) => {
   const method = req.body?.method;
 
@@ -307,7 +214,7 @@ const handleMcpPost = async (req, res) => {
     if (req.user_email) {
         console.log(`[Security] Injecting email to n8n: ${req.user_email}`);
         
-        // n8n이 기다리는 'email' 변수에 강제로 덮어씌웁니다!
+        // [핵심 수정] n8n이 기다리는 'email' 변수에 강제로 덮어씌웁니다!
         req.body.params.arguments.email = req.user_email;
         
         // (혹시 모르니 기존 user_email도 같이 보내둡니다)
@@ -333,7 +240,7 @@ const handleMcpPost = async (req, res) => {
       if (lastSessionId) { const session = sessions.get(lastSessionId); await session.sendToN8n(req.body); return res.status(202).end(); }
       
       const tempId = `temp-${crypto.randomUUID()}`; const tempSession = new N8nSession(tempId, null);
-      try { await new Promise(r => setTimeout(r, 5000)); const response = await tempSession.sendToN8nAndWait(req.body); return res.json(response); } finally { tempSession.close(); }
+      try { await new Promise(r => setTimeout(r, 1000)); const response = await tempSession.sendToN8nAndWait(req.body); return res.json(response); } finally { tempSession.close(); }
     } catch (e) { return res.status(500).json({ error: e.message }); }
   }
   res.status(200).send("OK");
@@ -354,41 +261,8 @@ const handleSseConnection = (req, res) => {
 // 라우트 등록
 app.get("/", (req, res) => res.send("MCP Server Running")); // 루트는 401 안 걸리게 단순 메시지
 
-// ---------------------------------------------------------------------
-// [GPT] GPT 라우트 (QuickMcpClient 사용)
-// ---------------------------------------------------------------------
-app.post('/gpt/execute', async (req, res) => {
-  let client = null;
-  try {
-    console.log("👉 [GPT] Start Request");
-    const { toolName, arguments: nestedArgs, ...restBody } = req.body;
-    if (!toolName) return res.status(400).json({ error: "toolName is required" });
 
-    // 인자 정리
-    let finalArguments = {};
-    if (nestedArgs) {
-        if (typeof nestedArgs === 'string') {
-            try { finalArguments = JSON.parse(nestedArgs); } catch (e) { finalArguments = {}; }
-        } else { finalArguments = nestedArgs; }
-    } else if (Object.keys(restBody).length > 0) { finalArguments = restBody; }
-
-    console.log(`👉 [GPT] Tool: ${toolName}`);
-    
-    client = new QuickMcpClient();
-    await client.connectAndInit(); 
-    const result = await client.executeTool(toolName, finalArguments);
-    
-    console.log("👉 [GPT] Success");
-    res.json(result);
-  } catch (error) {
-    console.error("❌ GPT Error:", error);
-    res.status(500).json({ error: error.message });
-  } finally { if (client) client.close(); }
-});
-// ---------------------------------------------------------------------
-
-
-// [GPT] 개인정보 처리방침 (Privacy Policy) 페이지
+// 개인정보 처리방침 (Privacy Policy) 페이지
 app.get("/privacy", (req, res) => {
   const html = `
     <html>
